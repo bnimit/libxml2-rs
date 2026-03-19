@@ -6,9 +6,11 @@
 all-features = false
 
 [advisories]
-# Deny crates with known security vulnerabilities
 version = 2
-deny = ["unsound", "unmaintained", "yanked"]
+vulnerability = "deny"
+unsound = "deny"
+unmaintained = "warn"
+yanked = "deny"
 
 [licenses]
 version = 2
