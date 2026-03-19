@@ -11,3 +11,12 @@ homepage.workspace    = true
 [dependencies]
 
 [dev-dependencies]
+# No extra dev-deps yet — the xmlconf test runner uses only std + libxml2-rs itself.
+
+# `harness = false` tells Cargo to use the file's own `main()` instead of the
+# default test harness.  This gives us full control over output formatting and
+# lets us print a rich pass/fail summary across all ~2,000 conformance cases.
+[[test]]
+name    = "xmlconf"
+path    = "tests/xmlconf.rs"
+harness = false

@@ -7,3 +7,6 @@ Cargo.lock
 /tests/xmlconf/*
 !/tests/xmlconf/.gitkeep
 /tests/*.tar.gz
+crates/libxml2-rs/tests/xmlconf/*
+!crates/libxml2-rs/tests/xmlconf/.gitkeep
+crates/libxml2-rs/tests/*.tar.gz
