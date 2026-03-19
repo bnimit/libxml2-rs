@@ -29,6 +29,7 @@
 
 extern crate alloc;
 
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -570,6 +571,125 @@ pub enum BuildError {
     UnexpectedEndTag,
     /// A namespace prefix was used that has no binding in the current scope.
     UnboundNamespacePrefix(Box<str>),
+    /// A numeric character reference (`&#NNN;` or `&#xNN;`) refers to a
+    /// code point that is not a legal XML 1.0 character.
+    InvalidCharacterReference(u32),
+}
+
+// ---------------------------------------------------------------------------
+// Entity / character-reference decoder
+// ---------------------------------------------------------------------------
+
+/// Decode XML entity and character references in `input`, returning the
+/// decoded text.
+///
+/// Returns `Cow::Borrowed(input)` with no allocation when `input` contains
+/// no `&` characters (the common case for plain text).
+///
+/// Handles:
+/// - Predefined entities: `&amp;` `&lt;` `&gt;` `&apos;` `&quot;`
+/// - Decimal character references: `&#NNN;`
+/// - Hex character references: `&#xNN;` or `&#XNN;`
+/// - Unknown named entities (e.g. `&foo;`) are passed through unchanged
+///   until DTD-based expansion is implemented in a later issue.
+///
+/// # Errors
+///
+/// Returns [`BuildError::InvalidCharacterReference`] if a numeric reference
+/// names a code point that is not a legal XML 1.0 character (§2.2).
+pub(crate) fn decode_entities(input: &str) -> Result<Cow<'_, str>, BuildError> {
+    // Fast path: no `&` present — nothing to decode.
+    if !input.contains('&') {
+        return Ok(Cow::Borrowed(input));
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+
+    while let Some(amp) = rest.find('&') {
+        // Push everything before the `&` verbatim.
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp + 1..]; // skip `&`
+
+        // Find the closing `;`.
+        let semi = match rest.find(';') {
+            Some(i) => i,
+            None => {
+                // Malformed — no closing `;`. Pass `&` through and continue.
+                out.push('&');
+                continue;
+            }
+        };
+
+        let reference = &rest[..semi];
+        rest = &rest[semi + 1..]; // skip past `;`
+
+        if let Some(digits) = reference.strip_prefix('#') {
+            // Numeric character reference: &#NNN; or &#xNN;
+            if let Some(hex) = digits
+                .strip_prefix('x')
+                .or_else(|| digits.strip_prefix('X'))
+            {
+                // &#xNN; — hexadecimal character reference
+                let code = u32::from_str_radix(hex, 16).unwrap_or(u32::MAX);
+                let ch = xml_char_from_codepoint(code)?;
+                out.push(ch);
+            } else {
+                // &#NNN; — decimal character reference
+                let code = digits.parse::<u32>().unwrap_or(u32::MAX);
+                let ch = xml_char_from_codepoint(code)?;
+                out.push(ch);
+            }
+        } else if !reference.is_empty() {
+            if reference == "amp" {
+                out.push('&');
+            } else if reference == "lt" {
+                out.push('<');
+            } else if reference == "gt" {
+                out.push('>');
+            } else if reference == "apos" {
+                out.push('\'');
+            } else if reference == "quot" {
+                out.push('"');
+            } else {
+                // Unknown named entity — pass through unchanged until DTD
+                // expansion is implemented in issue #12.
+                out.push('&');
+                out.push_str(reference);
+                out.push(';');
+            }
+        } else {
+            // Empty reference `&;` — pass through.
+            out.push('&');
+            out.push(';');
+        }
+    }
+
+    // Push the remainder after the last `&` (or the whole string if no `&`
+    // was processed in the loop above but the fast-path check missed it).
+    out.push_str(rest);
+    Ok(Cow::Owned(out))
+}
+
+/// Validate `code` against XML 1.0 §2.2 legal character ranges and return
+/// the corresponding `char`, or [`BuildError::InvalidCharacterReference`].
+///
+/// Legal: `#x9 | #xA | #xD | [#x20–#xD7FF] | [#xE000–#xFFFD] | [#x10000–#x10FFFF]`
+fn xml_char_from_codepoint(code: u32) -> Result<char, BuildError> {
+    let ok = matches!(
+        code,
+        0x9 | 0xA | 0xD
+        | 0x20..=0xD7FF
+        | 0xE000..=0xFFFD
+        | 0x10000..=0x10FFFF
+    );
+    if ok {
+        // Safety: all accepted code points are valid Unicode scalar values
+        // (we excluded surrogates 0xD800–0xDFFF and the non-chars 0xFFFE/0xFFFF).
+        char::from_u32(code).ok_or(BuildError::InvalidCharacterReference(code))
+    } else {
+        Err(BuildError::InvalidCharacterReference(code))
+    }
 }
 
 /// Builds a [`Document`] by processing a stream of [`xml_tokenizer::Token`]s.
@@ -666,11 +786,12 @@ impl Builder {
                     let aq = self.ns.resolve_attr_name(attr_name).map_err(
                         |xml_ns::NsError::UnboundPrefix(p)| BuildError::UnboundNamespacePrefix(p),
                     )?;
+                    let decoded_value = decode_entities(attr_value)?;
                     self.doc.add_attr_ns(
                         elem,
                         aq.local.as_ref(),
                         aq.ns.as_ref().map(|u| u.as_str()).unwrap_or(""),
-                        attr_value,
+                        decoded_value.as_ref(),
                     );
                 }
 
@@ -695,9 +816,17 @@ impl Builder {
                 }
             }
 
-            Token::Text { raw, .. } => {
+            Token::Text {
+                raw,
+                needs_unescape,
+            } => {
                 let parent = self.current();
-                self.doc.append_text(parent, raw);
+                if needs_unescape {
+                    let decoded = decode_entities(raw)?;
+                    self.doc.append_text(parent, decoded.as_ref());
+                } else {
+                    self.doc.append_text(parent, raw);
+                }
             }
 
             Token::Comment { content } => {
@@ -1138,5 +1267,111 @@ mod tests {
     fn parse_attrs_empty() {
         let pairs: Vec<_> = parse_raw_attrs("").collect();
         assert!(pairs.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // decode_entities
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decode_no_entities_borrows() {
+        // Fast path: no `&` → Borrowed (no allocation).
+        let result = decode_entities("hello world").unwrap();
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result.as_ref(), "hello world");
+    }
+
+    #[test]
+    fn decode_predefined_amp() {
+        assert_eq!(decode_entities("a &amp; b").unwrap().as_ref(), "a & b");
+    }
+
+    #[test]
+    fn decode_predefined_lt_gt() {
+        assert_eq!(decode_entities("&lt;tag&gt;").unwrap().as_ref(), "<tag>");
+    }
+
+    #[test]
+    fn decode_predefined_apos_quot() {
+        assert_eq!(decode_entities("&apos;&quot;").unwrap().as_ref(), "'\"");
+    }
+
+    #[test]
+    fn decode_decimal_reference() {
+        // &#65; = 'A'
+        assert_eq!(decode_entities("&#65;").unwrap().as_ref(), "A");
+    }
+
+    #[test]
+    fn decode_hex_reference_lower() {
+        // &#x41; = 'A'
+        assert_eq!(decode_entities("&#x41;").unwrap().as_ref(), "A");
+    }
+
+    #[test]
+    fn decode_hex_reference_upper() {
+        // &#X41; = 'A'
+        assert_eq!(decode_entities("&#X41;").unwrap().as_ref(), "A");
+    }
+
+    #[test]
+    fn decode_invalid_codepoint_is_error() {
+        // U+0000 is not a legal XML 1.0 character.
+        assert_eq!(
+            decode_entities("&#0;"),
+            Err(BuildError::InvalidCharacterReference(0))
+        );
+    }
+
+    #[test]
+    fn decode_surrogate_is_error() {
+        // U+D800 is a surrogate — illegal in XML 1.0 §2.2.
+        assert_eq!(
+            decode_entities("&#xD800;"),
+            Err(BuildError::InvalidCharacterReference(0xD800))
+        );
+    }
+
+    #[test]
+    fn decode_unknown_entity_passthrough() {
+        // Unknown named entity — passed through unchanged until DTD (#12).
+        assert_eq!(decode_entities("&unknown;").unwrap().as_ref(), "&unknown;");
+    }
+
+    #[test]
+    fn decode_mixed_content() {
+        assert_eq!(
+            decode_entities("a &amp; b &#x3C; c").unwrap().as_ref(),
+            "a & b < c"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Entity decoding integration (via Builder)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn builder_text_entity_decoded() {
+        let doc = build(b"<p>a &amp; b</p>").unwrap();
+        let p = doc.first_child(doc.root()).unwrap();
+        let txt = doc.first_child(p).unwrap();
+        assert_eq!(doc.value(txt), "a & b");
+    }
+
+    #[test]
+    fn builder_text_numeric_entity_decoded() {
+        let doc = build(b"<p>&#x41;</p>").unwrap();
+        let p = doc.first_child(doc.root()).unwrap();
+        let txt = doc.first_child(p).unwrap();
+        assert_eq!(doc.value(txt), "A");
+    }
+
+    #[test]
+    fn builder_attr_entity_decoded() {
+        let doc = build(b"<a href=\"a&amp;b\"/>").unwrap();
+        let a = doc.first_child(doc.root()).unwrap();
+        let attrs = doc.attrs(a);
+        let href = attrs.iter().find(|a| doc.attr_name(a) == "href").unwrap();
+        assert_eq!(doc.attr_value(href), "a&b");
     }
 }

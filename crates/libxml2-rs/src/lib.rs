@@ -382,6 +382,10 @@ fn build_err_to_parse_err(e: xml_tree::BuildError) -> ParseError {
             offset: 0,
             message: format!("unbound namespace prefix: {p}"),
         },
+        xml_tree::BuildError::InvalidCharacterReference(code) => ParseError::NotWellFormed {
+            offset: 0,
+            message: format!("invalid character reference: U+{code:04X}"),
+        },
     }
 }
 
