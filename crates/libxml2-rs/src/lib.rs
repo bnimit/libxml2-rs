@@ -216,6 +216,34 @@ impl Document {
     pub fn tree(&self) -> &xml_tree::Document {
         &self.inner
     }
+
+    /// Serialize this document to a compact XML string (no XML declaration,
+    /// no indentation).
+    ///
+    /// Text content and attribute values are properly escaped.
+    pub fn to_xml_string(&self) -> String {
+        self.inner
+            .to_xml_string(&xml_tree::SerializeOptions::default())
+    }
+
+    /// Serialize this document to an indented XML string (2-space indent, no
+    /// XML declaration).
+    pub fn to_xml_string_formatted(&self) -> String {
+        self.inner.to_xml_string(&xml_tree::SerializeOptions {
+            indent: Some("  ".into()),
+            ..xml_tree::SerializeOptions::default()
+        })
+    }
+
+    /// Write this document as compact XML to `writer`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`std::io::Error`] returned by `writer`.
+    pub fn write_xml<W: std::io::Write>(&self, mut writer: W) -> std::io::Result<()> {
+        let xml = self.to_xml_string();
+        writer.write_all(xml.as_bytes())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -700,5 +728,41 @@ mod tests {
     fn sniff_xml_encoding_label_none_without_decl() {
         let xml = b"<root/>";
         assert_eq!(sniff_xml_encoding_label(xml), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Document serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn document_to_xml_string_roundtrip() {
+        let xml = b"<root><child attr=\"val\">text</child></root>";
+        let doc = parse_bytes(xml, &ParserOptions::default()).unwrap();
+        let serialized = doc.to_xml_string();
+        // Re-parse must succeed and preserve structure.
+        let doc2 = parse_bytes(serialized.as_bytes(), &ParserOptions::default()).unwrap();
+        let tree2 = doc2.tree();
+        let root = tree2.first_child(doc2.root()).unwrap();
+        assert_eq!(tree2.name(root), "root");
+        let child = tree2.first_child(root).unwrap();
+        assert_eq!(tree2.name(child), "child");
+    }
+
+    #[test]
+    fn document_to_xml_string_formatted_is_parseable() {
+        let xml = b"<a><b><c/></b></a>";
+        let doc = parse_bytes(xml, &ParserOptions::default()).unwrap();
+        let formatted = doc.to_xml_string_formatted();
+        assert!(formatted.contains('\n'));
+        parse_bytes(formatted.as_bytes(), &ParserOptions::default()).unwrap();
+    }
+
+    #[test]
+    fn document_write_xml() {
+        let xml = b"<root/>";
+        let doc = parse_bytes(xml, &ParserOptions::default()).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        doc.write_xml(&mut buf).unwrap();
+        assert_eq!(buf, b"<root/>");
     }
 }

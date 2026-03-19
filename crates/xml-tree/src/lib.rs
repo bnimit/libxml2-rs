@@ -559,6 +559,360 @@ impl<'a> Iterator for ChildIter<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Serialization
+// ---------------------------------------------------------------------------
+
+/// Controls when the `<?xml version="1.0" encoding="…"?>` declaration is emitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XmlDeclMode {
+    /// Always emit the declaration.
+    Emit,
+    /// Never emit the declaration (default).
+    Omit,
+}
+
+/// Options that control XML serialization.
+#[derive(Debug, Clone)]
+pub struct SerializeOptions {
+    /// Indentation string for each nesting level (e.g. `"  "`).
+    /// `None` (the default) produces compact single-line output.
+    pub indent: Option<String>,
+    /// Whether to emit the XML declaration.  Default: [`XmlDeclMode::Omit`].
+    pub xml_decl: XmlDeclMode,
+    /// Encoding label written in the XML declaration.  Default: `"UTF-8"`.
+    pub declared_encoding: String,
+}
+
+impl Default for SerializeOptions {
+    fn default() -> Self {
+        Self {
+            indent: None,
+            xml_decl: XmlDeclMode::Omit,
+            declared_encoding: String::from("UTF-8"),
+        }
+    }
+}
+
+impl Document {
+    /// Serialize this document to an XML string.
+    ///
+    /// All text content is properly escaped.  Namespace declarations are
+    /// re-emitted from the stored namespace URI metadata using synthetic
+    /// prefixes (`ns0`, `ns1`, …).
+    pub fn to_xml_string(&self, opts: &SerializeOptions) -> String {
+        Serializer::new(self, opts).run_document()
+    }
+
+    /// Serialize a single node (and its subtree) to an XML string.
+    ///
+    /// The XML declaration is not emitted regardless of `opts.xml_decl`.
+    pub fn serialize_node(&self, node: NodeId, opts: &SerializeOptions) -> String {
+        let mut s = Serializer::new(self, opts);
+        s.node(node, 0);
+        s.out
+    }
+}
+
+/// Internal XML serializer.
+struct Serializer<'d> {
+    doc: &'d Document,
+    opts: &'d SerializeOptions,
+    /// Output buffer.
+    out: String,
+    /// Flat namespace scope: `(uri, prefix)` pairs pushed when a namespace is
+    /// first declared; truncated back when the declaring element closes.
+    ns_scope: Vec<(String, String)>,
+    /// Counter for generating synthetic namespace prefixes.
+    ns_idx: u32,
+}
+
+impl<'d> Serializer<'d> {
+    fn new(doc: &'d Document, opts: &'d SerializeOptions) -> Self {
+        Self {
+            doc,
+            opts,
+            out: String::new(),
+            ns_scope: Vec::new(),
+            ns_idx: 0,
+        }
+    }
+
+    fn run_document(mut self) -> String {
+        if self.opts.xml_decl == XmlDeclMode::Emit {
+            self.out.push_str("<?xml version=\"1.0\" encoding=\"");
+            self.out.push_str(&self.opts.declared_encoding);
+            self.out.push_str("\"?>");
+            if self.opts.indent.is_some() {
+                self.out.push('\n');
+            }
+        }
+        let children: Vec<NodeId> = self.doc.children(self.doc.root()).collect();
+        for child in children {
+            self.node(child, 0);
+        }
+        self.out
+    }
+
+    /// Look up the prefix currently in scope for `uri`.
+    fn find_prefix(&self, uri: &str) -> Option<String> {
+        self.ns_scope
+            .iter()
+            .rev()
+            .find(|(u, _)| u == uri)
+            .map(|(_, p)| p.clone())
+    }
+
+    /// Return the prefix for `uri`, assigning a new one if needed and
+    /// recording the declaration in `new_decls`.
+    fn ensure_prefix(&mut self, uri: &str, new_decls: &mut Vec<(String, String)>) -> String {
+        if let Some(p) = self.find_prefix(uri) {
+            return p;
+        }
+        // Already queued for this element?
+        if let Some((_, p)) = new_decls.iter().find(|(u, _)| u == uri) {
+            return p.clone();
+        }
+        let p = alloc::format!("ns{}", self.ns_idx);
+        self.ns_idx += 1;
+        new_decls.push((uri.to_string(), p.clone()));
+        p
+    }
+
+    /// Dispatch serialization of a single node.
+    fn node(&mut self, id: NodeId, depth: usize) {
+        match self.doc.kind(id) {
+            NodeKind::Element => self.element(id, depth),
+            NodeKind::Text => {
+                push_text_escaped(&mut self.out, self.doc.value(id));
+            }
+            NodeKind::Comment => {
+                self.out.push_str("<!--");
+                self.out.push_str(self.doc.value(id));
+                self.out.push_str("-->");
+                if self.opts.indent.is_some() {
+                    self.out.push('\n');
+                }
+            }
+            NodeKind::CData => {
+                self.out.push_str("<![CDATA[");
+                push_cdata_content(&mut self.out, self.doc.value(id));
+                self.out.push_str("]]>");
+            }
+            NodeKind::Pi => {
+                let target = self.doc.name(id);
+                let data = self.doc.value(id);
+                self.out.push_str("<?");
+                self.out.push_str(target);
+                if !data.is_empty() {
+                    self.out.push(' ');
+                    self.out.push_str(data);
+                }
+                self.out.push_str("?>");
+                if self.opts.indent.is_some() {
+                    self.out.push('\n');
+                }
+            }
+            // Other node kinds (document, entity-ref, …) are not serialized.
+            _ => {}
+        }
+    }
+
+    fn element(&mut self, id: NodeId, depth: usize) {
+        let local_name = self.doc.name(id).to_string();
+        let ns_uri = self.doc.ns_uri(id).to_string();
+        // Save scope position so we can restore it on exit.
+        let scope_start = self.ns_scope.len();
+
+        let mut new_decls: Vec<(String, String)> = Vec::new();
+
+        // ── Element namespace ────────────────────────────────────────────────
+        let elem_prefix: Option<String> = if ns_uri.is_empty() {
+            None
+        } else {
+            Some(self.ensure_prefix(&ns_uri, &mut new_decls))
+        };
+
+        // ── Attributes ───────────────────────────────────────────────────────
+        // Pre-collect attribute data to avoid borrow-checker friction.
+        struct PreparedAttr {
+            prefix: String, // empty = no namespace
+            local: String,
+            value: String,
+            skip: bool, // xmlns declarations are re-emitted from ns metadata
+        }
+        let raw_attrs: Vec<_> = self
+            .doc
+            .attrs(id)
+            .iter()
+            .map(|a| {
+                let ns = self.doc.attr_ns_uri(a).to_string();
+                let name = self.doc.attr_name(a).to_string();
+                let val = self.doc.attr_value(a).to_string();
+                (ns, name, val)
+            })
+            .collect();
+
+        let mut prepared: Vec<PreparedAttr> = Vec::with_capacity(raw_attrs.len());
+        for (attr_ns, attr_local, attr_val) in &raw_attrs {
+            // Skip namespace declaration attributes — we re-emit them below.
+            let is_xmlns_decl = (attr_local == "xmlns" && attr_ns.is_empty())
+                || attr_ns == "http://www.w3.org/2000/xmlns/";
+            if is_xmlns_decl {
+                prepared.push(PreparedAttr {
+                    prefix: String::new(),
+                    local: attr_local.clone(),
+                    value: attr_val.clone(),
+                    skip: true,
+                });
+                continue;
+            }
+            let prefix = if attr_ns.is_empty() {
+                String::new()
+            } else {
+                self.ensure_prefix(attr_ns, &mut new_decls)
+            };
+            prepared.push(PreparedAttr {
+                prefix,
+                local: attr_local.clone(),
+                value: attr_val.clone(),
+                skip: false,
+            });
+        }
+
+        // Push new declarations into the scope so descendant elements can
+        // reuse the same prefix without re-declaring.
+        for decl in &new_decls {
+            self.ns_scope.push(decl.clone());
+        }
+
+        // ── Emit opening tag ─────────────────────────────────────────────────
+        if let Some(ref ind) = self.opts.indent {
+            for _ in 0..depth {
+                self.out.push_str(ind);
+            }
+        }
+        self.out.push('<');
+        if let Some(ref p) = elem_prefix {
+            self.out.push_str(p);
+            self.out.push(':');
+        }
+        self.out.push_str(&local_name);
+
+        // Emit xmlns declarations for newly introduced namespaces.
+        for (uri, prefix) in &new_decls {
+            self.out.push_str(" xmlns:");
+            self.out.push_str(prefix);
+            self.out.push_str("=\"");
+            push_attr_escaped(&mut self.out, uri);
+            self.out.push('"');
+        }
+
+        // Emit regular attributes.
+        for attr in &prepared {
+            if attr.skip {
+                continue;
+            }
+            self.out.push(' ');
+            if !attr.prefix.is_empty() {
+                self.out.push_str(&attr.prefix);
+                self.out.push(':');
+            }
+            self.out.push_str(&attr.local);
+            self.out.push_str("=\"");
+            push_attr_escaped(&mut self.out, &attr.value);
+            self.out.push('"');
+        }
+
+        // ── Children ─────────────────────────────────────────────────────────
+        let children: Vec<NodeId> = self.doc.children(id).collect();
+        if children.is_empty() {
+            self.out.push_str("/>");
+            if self.opts.indent.is_some() {
+                self.out.push('\n');
+            }
+        } else {
+            self.out.push('>');
+
+            // In indent mode, add a newline before the first child only when
+            // there are element children (avoid mangling text-only content).
+            let has_elem_children = children
+                .iter()
+                .any(|&c| self.doc.kind(c) == NodeKind::Element);
+            if self.opts.indent.is_some() && has_elem_children {
+                self.out.push('\n');
+            }
+
+            for &child in &children {
+                self.node(child, depth + 1);
+            }
+
+            // Closing tag indentation.
+            if self.opts.indent.is_some() && has_elem_children {
+                if let Some(ref ind) = self.opts.indent {
+                    for _ in 0..depth {
+                        self.out.push_str(ind);
+                    }
+                }
+            }
+            self.out.push_str("</");
+            if let Some(ref p) = elem_prefix {
+                self.out.push_str(p);
+                self.out.push(':');
+            }
+            self.out.push_str(&local_name);
+            self.out.push('>');
+            if self.opts.indent.is_some() {
+                self.out.push('\n');
+            }
+        }
+
+        // Restore namespace scope.
+        self.ns_scope.truncate(scope_start);
+    }
+}
+
+/// Escape `s` for use in XML text content (`<`, `>`, `&`).
+fn push_text_escaped(out: &mut String, s: &str) {
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+/// Escape `s` for use in an XML attribute value (double-quoted).
+fn push_attr_escaped(out: &mut String, s: &str) {
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+/// Write `s` as CDATA content, splitting on any embedded `]]>` sequences.
+///
+/// The caller is responsible for wrapping with `<![CDATA[` and `]]>`.
+fn push_cdata_content(out: &mut String, s: &str) {
+    // The sequence `]]>` cannot appear inside a CDATA section.
+    // Split it by closing/reopening: `]]>` → `]]` (in CDATA) + `]]>` (end)
+    // + `<![CDATA[>` (new CDATA starting with `>`).
+    let mut rest = s;
+    while let Some(pos) = rest.find("]]>") {
+        out.push_str(&rest[..pos]); // content before ]]>
+        out.push_str("]]]]><![CDATA[>"); // ]] (in CDATA) + ]]> (end) + <![CDATA[> (start+>)
+        rest = &rest[pos + 3..]; // skip past ]]>
+    }
+    out.push_str(rest);
+}
+
+// ---------------------------------------------------------------------------
 // Builder — SAX-style tree construction
 // ---------------------------------------------------------------------------
 
@@ -1373,5 +1727,161 @@ mod tests {
         let attrs = doc.attrs(a);
         let href = attrs.iter().find(|a| doc.attr_name(a) == "href").unwrap();
         assert_eq!(doc.attr_value(href), "a&b");
+    }
+
+    // -----------------------------------------------------------------------
+    // Serialization
+    // -----------------------------------------------------------------------
+
+    /// Parse `xml`, serialize with default options, reparse, and return both
+    /// documents.  Used for structural round-trip assertions.
+    fn roundtrip(xml: &[u8]) -> (Document, Document) {
+        let original = build(xml).unwrap();
+        let serialized = original.to_xml_string(&SerializeOptions::default());
+        let reparsed = build(serialized.as_bytes()).unwrap();
+        (original, reparsed)
+    }
+
+    #[test]
+    fn serialize_simple_element() {
+        let doc = build(b"<root/>").unwrap();
+        assert_eq!(doc.to_xml_string(&SerializeOptions::default()), "<root/>");
+    }
+
+    #[test]
+    fn serialize_element_with_text() {
+        let doc = build(b"<p>hello</p>").unwrap();
+        assert_eq!(
+            doc.to_xml_string(&SerializeOptions::default()),
+            "<p>hello</p>"
+        );
+    }
+
+    #[test]
+    fn serialize_text_escaping() {
+        let doc = build(b"<p>a &amp; b &lt; c</p>").unwrap();
+        // Text content is decoded on parse, re-encoded on serialize.
+        assert_eq!(
+            doc.to_xml_string(&SerializeOptions::default()),
+            "<p>a &amp; b &lt; c</p>"
+        );
+    }
+
+    #[test]
+    fn serialize_attr_escaping() {
+        let doc = build(b"<a href=\"a&amp;b\"/>").unwrap();
+        assert_eq!(
+            doc.to_xml_string(&SerializeOptions::default()),
+            "<a href=\"a&amp;b\"/>"
+        );
+    }
+
+    #[test]
+    fn serialize_nested_elements() {
+        let doc = build(b"<a><b><c/></b></a>").unwrap();
+        assert_eq!(
+            doc.to_xml_string(&SerializeOptions::default()),
+            "<a><b><c/></b></a>"
+        );
+    }
+
+    #[test]
+    fn serialize_comment() {
+        let doc = build(b"<r><!-- hi --></r>").unwrap();
+        assert_eq!(
+            doc.to_xml_string(&SerializeOptions::default()),
+            "<r><!-- hi --></r>"
+        );
+    }
+
+    #[test]
+    fn serialize_pi() {
+        let doc = build(b"<r><?foo bar?></r>").unwrap();
+        assert_eq!(
+            doc.to_xml_string(&SerializeOptions::default()),
+            "<r><?foo bar?></r>"
+        );
+    }
+
+    #[test]
+    fn serialize_cdata() {
+        let doc = build(b"<r><![CDATA[<b>raw</b>]]></r>").unwrap();
+        assert_eq!(
+            doc.to_xml_string(&SerializeOptions::default()),
+            "<r><![CDATA[<b>raw</b>]]></r>"
+        );
+    }
+
+    #[test]
+    fn serialize_cdata_split_on_cdata_end() {
+        // Build a CDATA node whose content contains "]]>" directly (not via parsing,
+        // since the XML parser would already split it).
+        let mut doc = Document::new();
+        let r = doc.append_element(doc.root(), "r");
+        doc.append_cdata(r, "a]]>b");
+        let xml = doc.to_xml_string(&SerializeOptions::default());
+        // The serialized form must be re-parseable.
+        let doc2 = build(xml.as_bytes()).unwrap();
+        let r2 = doc2.first_child(doc2.root()).unwrap();
+        // The split may produce multiple CDATA / text nodes; concatenate all values.
+        let content: String = doc2.children(r2).map(|c| doc2.value(c)).collect();
+        assert_eq!(content, "a]]>b");
+    }
+
+    #[test]
+    fn serialize_xml_decl() {
+        let opts = SerializeOptions {
+            xml_decl: XmlDeclMode::Emit,
+            declared_encoding: "UTF-8".into(),
+            indent: None,
+        };
+        let doc = build(b"<root/>").unwrap();
+        assert_eq!(
+            doc.to_xml_string(&opts),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><root/>"
+        );
+    }
+
+    #[test]
+    fn serialize_indented() {
+        let opts = SerializeOptions {
+            indent: Some("  ".into()),
+            ..SerializeOptions::default()
+        };
+        let doc = build(b"<a><b/></a>").unwrap();
+        let xml = doc.to_xml_string(&opts);
+        // Must contain a newline between elements.
+        assert!(xml.contains('\n'), "expected indented output: {xml}");
+        // Must be re-parseable.
+        build(xml.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn serialize_namespaced_element_roundtrip() {
+        let (orig, reparsed) = roundtrip(b"<svg:circle xmlns:svg=\"http://www.w3.org/2000/svg\"/>");
+        let orig_root = orig.first_child(orig.root()).unwrap();
+        let rp_root = reparsed.first_child(reparsed.root()).unwrap();
+        assert_eq!(orig.name(orig_root), reparsed.name(rp_root));
+        assert_eq!(orig.ns_uri(orig_root), reparsed.ns_uri(rp_root));
+    }
+
+    #[test]
+    fn serialize_default_namespace_roundtrip() {
+        let (orig, reparsed) = roundtrip(b"<root xmlns=\"http://example.com\"><child/></root>");
+        let orig_root = orig.first_child(orig.root()).unwrap();
+        let rp_root = reparsed.first_child(reparsed.root()).unwrap();
+        assert_eq!(orig.ns_uri(orig_root), reparsed.ns_uri(rp_root));
+        let orig_child = orig.first_child(orig_root).unwrap();
+        let rp_child = reparsed.first_child(rp_root).unwrap();
+        assert_eq!(orig.ns_uri(orig_child), reparsed.ns_uri(rp_child));
+    }
+
+    #[test]
+    fn serialize_node_subtree() {
+        let doc = build(b"<a><b><c/></b></a>").unwrap();
+        let a = doc.first_child(doc.root()).unwrap();
+        let b = doc.first_child(a).unwrap();
+        let xml = doc.serialize_node(b, &SerializeOptions::default());
+        assert_eq!(xml, "<b><c/></b>");
     }
 }
