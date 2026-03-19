@@ -13,9 +13,10 @@ default  = ["std"]
 std      = []
 
 [dependencies]
-xml-ns   = { path = "../xml-ns" }
-bumpalo  = { workspace = true }
-indexmap = { workspace = true }
-smallvec = { workspace = true }
+xml-ns        = { path = "../xml-ns" }
+xml-tokenizer = { path = "../xml-tokenizer" }
+bumpalo       = { workspace = true }
+indexmap      = { workspace = true }
+smallvec      = { workspace = true }
 
 [dev-dependencies]

@@ -8,9 +8,10 @@
 //!
 //! ```text
 //! Document
-//! ├── nodes: Vec<NodeData>   ← flat arena; NodeId is an index
-//! ├── string_arena: Bump     ← attribute values, text content
-//! └── names: IndexSet<str>   ← interned element/attribute names (NameId)
+//! ├── nodes: Vec<NodeData>        ← flat arena; NodeId is an index
+//! ├── strings: String             ← append-only text/value storage
+//! ├── attrs: Vec<AttrData>        ← flat attribute storage (ranges in NodeData)
+//! └── names: IndexSet<Box<str>>   ← interned element/attribute names (NameId)
 //! ```
 //!
 //! See `docs/architecture/overview.md` §5.1 for the full rationale.
@@ -19,12 +20,17 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
-// TODO(Phase 1): remove once all stub fields are wired up
-#![allow(dead_code)]
 
 extern crate alloc;
 
+use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
+use indexmap::IndexSet;
+
+// ---------------------------------------------------------------------------
+// Public ID types
+// ---------------------------------------------------------------------------
 
 /// An opaque handle to a node within a [`Document`].
 ///
@@ -35,6 +41,9 @@ use alloc::vec::Vec;
 pub struct NodeId(u32);
 
 /// An interned name identifier (index into `Document::names`).
+///
+/// NameId(0) is reserved as a sentinel meaning "no name" — it maps to the
+/// empty string `""` in the names table.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NameId(u32);
 
@@ -68,41 +77,76 @@ pub enum NodeKind {
     DocumentFragment = 11,
 }
 
-/// Internal storage for a single node. 64 bytes — fits in one cache line.
+// ---------------------------------------------------------------------------
+// Internal node storage — 64 bytes, one cache line
+// ---------------------------------------------------------------------------
+
+/// Internal storage for a single node.
 ///
-/// All string data (name, value) is stored as a `(offset, len)` range into
-/// `Document::string_arena`. Node cross-references use `Option<NodeId>`.
+/// Exactly 64 bytes (`repr(C)`), fitting in one cache line on all common
+/// architectures. String data (name, value) is stored by offset into
+/// `Document::strings`. Node links use `Option<NodeId>`.
 #[repr(C)]
 struct NodeData {
     kind: NodeKind,
     _pad: [u8; 3],
+    /// Interned name: element tag name, PI target, attribute name, etc.
     name: NameId,
     parent: Option<NodeId>,
     first_child: Option<NodeId>,
     last_child: Option<NodeId>,
     next_sibling: Option<NodeId>,
     prev_sibling: Option<NodeId>,
-    // Text/value content: byte range into string_arena
+    /// Byte offset of this node's string value in `Document::strings`.
     value_offset: u32,
+    /// Byte length of this node's string value.
     value_len: u32,
-    // Attributes: index range into Document::attrs
+    /// First index (inclusive) of this node's attributes in `Document::attrs`.
     attrs_start: u32,
+    /// Last index (exclusive) of this node's attributes in `Document::attrs`.
     attrs_end: u32,
 }
+
+// ---------------------------------------------------------------------------
+// Attribute storage
+// ---------------------------------------------------------------------------
+
+/// A single attribute — name interned, value stored in `Document::strings`.
+pub struct AttrData {
+    name: NameId,
+    value_offset: u32,
+    value_len: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Document
+// ---------------------------------------------------------------------------
 
 /// An XML document. Owns all node and string data.
 ///
 /// `Document` is `Send + Sync` — nodes are stored by index, not raw pointer.
 pub struct Document {
     nodes: Vec<NodeData>,
-    string_arena: bumpalo::Bump,
-    // TODO(Phase 1): add name interning table, attribute storage, ns table
+    /// Append-only string storage.  Offsets in `NodeData` and `AttrData` index
+    /// into this buffer.  The buffer never shrinks, so existing offsets are
+    /// always valid.
+    strings: String,
+    /// Flat attribute storage.  Each element's attributes are a contiguous
+    /// range `[attrs_start, attrs_end)` in this vec.
+    attrs: Vec<AttrData>,
+    /// Interned element/attribute names.  `NameId(i)` is the index.
+    /// `NameId(0)` is always `""` (sentinel for nameless nodes).
+    names: IndexSet<Box<str>>,
     root: NodeId,
 }
 
 impl Document {
     /// Create a new, empty document with a single document-root node.
     pub fn new() -> Self {
+        // Reserve NameId(0) = "" (sentinel for nameless nodes: text, comment…)
+        let mut names: IndexSet<Box<str>> = IndexSet::new();
+        names.insert(Box::from(""));
+
         let mut nodes = Vec::with_capacity(64);
         nodes.push(NodeData {
             kind: NodeKind::Document,
@@ -118,25 +162,37 @@ impl Document {
             attrs_start: 0,
             attrs_end: 0,
         });
+
         Self {
             nodes,
-            string_arena: bumpalo::Bump::new(),
+            strings: String::new(),
+            attrs: Vec::new(),
+            names,
             root: NodeId(0),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Read-only navigation
+    // -----------------------------------------------------------------------
 
     /// The document root node.
     pub fn root(&self) -> NodeId {
         self.root
     }
 
-    /// The kind of the node identified by `id`.
+    /// The kind of node `id`.
     ///
     /// # Panics
     ///
-    /// Panics if `id` does not belong to this document.
+    /// Panics if `id` is out of range for this document.
     pub fn kind(&self, id: NodeId) -> NodeKind {
         self.nodes[id.0 as usize].kind
+    }
+
+    /// The parent of `id`, if any.
+    pub fn parent(&self, id: NodeId) -> Option<NodeId> {
+        self.nodes[id.0 as usize].parent
     }
 
     /// The first child of `id`, if any.
@@ -144,14 +200,266 @@ impl Document {
         self.nodes[id.0 as usize].first_child
     }
 
+    /// The last child of `id`, if any.
+    pub fn last_child(&self, id: NodeId) -> Option<NodeId> {
+        self.nodes[id.0 as usize].last_child
+    }
+
     /// The next sibling of `id`, if any.
     pub fn next_sibling(&self, id: NodeId) -> Option<NodeId> {
         self.nodes[id.0 as usize].next_sibling
     }
 
-    /// The parent of `id`, if any.
-    pub fn parent(&self, id: NodeId) -> Option<NodeId> {
-        self.nodes[id.0 as usize].parent
+    /// The previous sibling of `id`, if any.
+    pub fn prev_sibling(&self, id: NodeId) -> Option<NodeId> {
+        self.nodes[id.0 as usize].prev_sibling
+    }
+
+    /// The name of node `id`.
+    ///
+    /// - For element nodes: the tag name (e.g. `"div"`).
+    /// - For processing instructions: the PI target.
+    /// - For text, comment, and CDATA nodes: their conventional pseudo-names
+    ///   (`"#text"`, `"#comment"`, `"#cdata-section"`).
+    /// - For the document root: `"#document"`.
+    pub fn name(&self, id: NodeId) -> &str {
+        match self.nodes[id.0 as usize].kind {
+            NodeKind::Text => "#text",
+            NodeKind::Comment => "#comment",
+            NodeKind::CData => "#cdata-section",
+            NodeKind::Document => "#document",
+            _ => self
+                .names
+                .get_index(self.nodes[id.0 as usize].name.0 as usize)
+                .map(|s| s.as_ref())
+                .unwrap_or(""),
+        }
+    }
+
+    /// The string value of node `id`.
+    ///
+    /// - For text, comment, CDATA, and PI nodes: the raw content.
+    /// - For element and document nodes: empty string (use [`children`] to
+    ///   recurse instead).
+    ///
+    /// [`children`]: Document::children
+    pub fn value(&self, id: NodeId) -> &str {
+        let n = &self.nodes[id.0 as usize];
+        &self.strings[n.value_offset as usize..][..n.value_len as usize]
+    }
+
+    /// The attributes of element node `id`.
+    ///
+    /// Returns an empty slice for non-element nodes.
+    pub fn attrs(&self, id: NodeId) -> &[AttrData] {
+        let n = &self.nodes[id.0 as usize];
+        &self.attrs[n.attrs_start as usize..n.attrs_end as usize]
+    }
+
+    /// The interned name of an attribute.
+    pub fn attr_name<'a>(&'a self, attr: &'a AttrData) -> &'a str {
+        self.names
+            .get_index(attr.name.0 as usize)
+            .map(|s| s.as_ref())
+            .unwrap_or("")
+    }
+
+    /// The value of an attribute.
+    pub fn attr_value<'a>(&'a self, attr: &'a AttrData) -> &'a str {
+        &self.strings[attr.value_offset as usize..][..attr.value_len as usize]
+    }
+
+    /// An iterator over the children of `id` in document order.
+    pub fn children(&self, id: NodeId) -> ChildIter<'_> {
+        ChildIter {
+            doc: self,
+            next: self.first_child(id),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Mutation — used by Builder; low-level
+    // -----------------------------------------------------------------------
+
+    /// Intern `name` into the name table, returning its [`NameId`].
+    ///
+    /// Subsequent calls with the same string return the same `NameId` without
+    /// allocating.
+    pub fn intern_name(&mut self, name: &str) -> NameId {
+        // Avoid allocating a Box if the name is already interned.
+        if let Some(idx) = self.names.get_index_of(name) {
+            return NameId(idx as u32);
+        }
+        let idx = self.names.len();
+        self.names.insert(Box::from(name));
+        NameId(idx as u32)
+    }
+
+    /// Copy `s` into the string arena, returning `(offset, len)`.
+    fn alloc_str(&mut self, s: &str) -> (u32, u32) {
+        let offset = self.strings.len() as u32;
+        let len = s.len() as u32;
+        self.strings.push_str(s);
+        (offset, len)
+    }
+
+    /// Allocate a raw node and return its [`NodeId`].
+    fn push_node(&mut self, data: NodeData) -> NodeId {
+        let id = NodeId(self.nodes.len() as u32);
+        self.nodes.push(data);
+        id
+    }
+
+    /// Link `child` as the last child of `parent`, maintaining the
+    /// doubly-linked sibling list.
+    fn append_child(&mut self, parent: NodeId, child: NodeId) {
+        // Rust note: we can't hold two mutable references into `self.nodes`
+        // simultaneously, so we read what we need first, then write.
+        let old_last = self.nodes[parent.0 as usize].last_child;
+
+        self.nodes[child.0 as usize].parent = Some(parent);
+        self.nodes[child.0 as usize].prev_sibling = old_last;
+
+        match old_last {
+            Some(prev) => self.nodes[prev.0 as usize].next_sibling = Some(child),
+            None => self.nodes[parent.0 as usize].first_child = Some(child),
+        }
+        self.nodes[parent.0 as usize].last_child = Some(child);
+    }
+
+    // -----------------------------------------------------------------------
+    // Higher-level append helpers
+    // -----------------------------------------------------------------------
+
+    /// Append an element child to `parent` and return its [`NodeId`].
+    ///
+    /// Attributes should be added immediately after with [`add_attr`].
+    ///
+    /// [`add_attr`]: Document::add_attr
+    pub fn append_element(&mut self, parent: NodeId, name: &str) -> NodeId {
+        let name_id = self.intern_name(name);
+        let attrs_start = self.attrs.len() as u32;
+        let id = self.push_node(NodeData {
+            kind: NodeKind::Element,
+            _pad: [0; 3],
+            name: name_id,
+            parent: None,
+            first_child: None,
+            last_child: None,
+            next_sibling: None,
+            prev_sibling: None,
+            value_offset: 0,
+            value_len: 0,
+            attrs_start,
+            attrs_end: attrs_start,
+        });
+        self.append_child(parent, id);
+        id
+    }
+
+    /// Append an attribute to element `elem`.
+    ///
+    /// Attributes must be added before any child nodes are appended to `elem`
+    /// to preserve the contiguous layout in `Document::attrs`.
+    pub fn add_attr(&mut self, elem: NodeId, name: &str, value: &str) {
+        debug_assert_eq!(
+            self.nodes[elem.0 as usize].attrs_end as usize,
+            self.attrs.len(),
+            "add_attr: attributes must be added before child nodes"
+        );
+        let name_id = self.intern_name(name);
+        let (value_offset, value_len) = self.alloc_str(value);
+        self.attrs.push(AttrData {
+            name: name_id,
+            value_offset,
+            value_len,
+        });
+        self.nodes[elem.0 as usize].attrs_end += 1;
+    }
+
+    /// Append a text node to `parent`.
+    pub fn append_text(&mut self, parent: NodeId, content: &str) -> NodeId {
+        let (value_offset, value_len) = self.alloc_str(content);
+        let id = self.push_node(NodeData {
+            kind: NodeKind::Text,
+            _pad: [0; 3],
+            name: NameId(0),
+            parent: None,
+            first_child: None,
+            last_child: None,
+            next_sibling: None,
+            prev_sibling: None,
+            value_offset,
+            value_len,
+            attrs_start: 0,
+            attrs_end: 0,
+        });
+        self.append_child(parent, id);
+        id
+    }
+
+    /// Append a comment node to `parent`.
+    pub fn append_comment(&mut self, parent: NodeId, content: &str) -> NodeId {
+        let (value_offset, value_len) = self.alloc_str(content);
+        let id = self.push_node(NodeData {
+            kind: NodeKind::Comment,
+            _pad: [0; 3],
+            name: NameId(0),
+            parent: None,
+            first_child: None,
+            last_child: None,
+            next_sibling: None,
+            prev_sibling: None,
+            value_offset,
+            value_len,
+            attrs_start: 0,
+            attrs_end: 0,
+        });
+        self.append_child(parent, id);
+        id
+    }
+
+    /// Append a CDATA section node to `parent`.
+    pub fn append_cdata(&mut self, parent: NodeId, content: &str) -> NodeId {
+        let (value_offset, value_len) = self.alloc_str(content);
+        let id = self.push_node(NodeData {
+            kind: NodeKind::CData,
+            _pad: [0; 3],
+            name: NameId(0),
+            parent: None,
+            first_child: None,
+            last_child: None,
+            next_sibling: None,
+            prev_sibling: None,
+            value_offset,
+            value_len,
+            attrs_start: 0,
+            attrs_end: 0,
+        });
+        self.append_child(parent, id);
+        id
+    }
+
+    /// Append a processing instruction node to `parent`.
+    pub fn append_pi(&mut self, parent: NodeId, target: &str, data: &str) -> NodeId {
+        let name_id = self.intern_name(target);
+        let (value_offset, value_len) = self.alloc_str(data);
+        let id = self.push_node(NodeData {
+            kind: NodeKind::Pi,
+            _pad: [0; 3],
+            name: name_id,
+            parent: None,
+            first_child: None,
+            last_child: None,
+            next_sibling: None,
+            prev_sibling: None,
+            value_offset,
+            value_len,
+            attrs_start: 0,
+            attrs_end: 0,
+        });
+        self.append_child(parent, id);
+        id
     }
 }
 
@@ -162,7 +470,520 @@ impl Default for Document {
 }
 
 // Safety: Document contains no raw pointers; all cross-node references are
-// integer indices. bumpalo::Bump is Send but not Sync; we only expose &Bump
-// internally, never to callers, so Document can be Sync too.
+// integer indices.  `strings: String` is `Send + Sync`.  `IndexSet` is
+// `Send + Sync` when its key type is.
 unsafe impl Send for Document {}
 unsafe impl Sync for Document {}
+
+// ---------------------------------------------------------------------------
+// ChildIter — forward iterator over a node's children
+// ---------------------------------------------------------------------------
+
+/// An iterator over the direct children of a node, in document order.
+///
+/// Created by [`Document::children`].
+pub struct ChildIter<'a> {
+    doc: &'a Document,
+    next: Option<NodeId>,
+}
+
+impl<'a> Iterator for ChildIter<'a> {
+    type Item = NodeId;
+
+    fn next(&mut self) -> Option<NodeId> {
+        let id = self.next?;
+        self.next = self.doc.next_sibling(id);
+        Some(id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Builder — SAX-style tree construction
+// ---------------------------------------------------------------------------
+
+/// Errors that can occur while building a document.
+#[derive(Debug, PartialEq)]
+pub enum BuildError {
+    /// The document contains no root element.
+    NoRootElement,
+    /// A closing tag was found with no matching opening tag.
+    UnexpectedEndTag,
+}
+
+/// Builds a [`Document`] by processing a stream of [`xml_tokenizer::Token`]s.
+///
+/// Call [`process_token`] for each token from the tokenizer, then call
+/// [`finish`] to get the completed document.
+///
+/// # Example
+///
+/// ```rust
+/// use xml_tokenizer::Tokenizer;
+/// use xml_tree::Builder;
+///
+/// let xml = b"<?xml version=\"1.0\"?><root><child/></root>";
+/// let mut tok = Tokenizer::new(xml).unwrap();
+/// let mut builder = Builder::new();
+/// loop {
+///     let token = tok.next_token().unwrap();
+///     let done = token == xml_tokenizer::Token::Eof;
+///     builder.process_token(token).unwrap();
+///     if done { break; }
+/// }
+/// let doc = builder.finish().unwrap();
+/// assert_eq!(doc.name(doc.first_child(doc.root()).unwrap()), "root");
+/// ```
+///
+/// [`process_token`]: Builder::process_token
+/// [`finish`]: Builder::finish
+pub struct Builder {
+    doc: Document,
+    /// Stack of open elements.  `stack[0]` is always the document root.
+    /// The "current node" is `stack.last()`.
+    stack: Vec<NodeId>,
+    /// Whether we have seen at least one root element.
+    root_element_seen: bool,
+}
+
+impl Builder {
+    /// Create a new builder with an empty document.
+    pub fn new() -> Self {
+        let doc = Document::new();
+        let root = doc.root();
+        Self {
+            doc,
+            stack: alloc::vec![root],
+            root_element_seen: false,
+        }
+    }
+
+    /// The node currently being built (top of the open-element stack).
+    fn current(&self) -> NodeId {
+        // Infallible because stack always has at least the document root.
+        *self.stack.last().unwrap()
+    }
+
+    /// Feed one token into the builder.
+    ///
+    /// Tokens should be fed in the order emitted by [`xml_tokenizer::Tokenizer`].
+    pub fn process_token(&mut self, token: xml_tokenizer::Token<'_>) -> Result<(), BuildError> {
+        use xml_tokenizer::Token;
+        match token {
+            // XML declaration — recorded implicitly; no tree node needed.
+            Token::XmlDecl { .. } => {}
+
+            // DOCTYPE — we accept it but don't store it in the tree yet.
+            Token::DoctypeDecl { .. } => {}
+
+            Token::StartTag {
+                name,
+                raw_attrs,
+                self_closing,
+            } => {
+                let parent = self.current();
+                let elem = self.doc.append_element(parent, name);
+
+                // Parse and attach attributes from the raw attr string.
+                for (attr_name, attr_value) in parse_raw_attrs(raw_attrs) {
+                    self.doc.add_attr(elem, attr_name, attr_value);
+                }
+
+                if !self_closing {
+                    self.stack.push(elem);
+                }
+                self.root_element_seen = true;
+            }
+
+            Token::EndTag { .. } => {
+                // Pop the current element.  The stack always keeps the
+                // document root (index 0), so len > 1 means we have an open
+                // element to close.
+                if self.stack.len() > 1 {
+                    self.stack.pop();
+                } else {
+                    return Err(BuildError::UnexpectedEndTag);
+                }
+            }
+
+            Token::Text { raw, .. } => {
+                let parent = self.current();
+                self.doc.append_text(parent, raw);
+            }
+
+            Token::Comment { content } => {
+                let parent = self.current();
+                self.doc.append_comment(parent, content);
+            }
+
+            Token::CData { content } => {
+                let parent = self.current();
+                self.doc.append_cdata(parent, content);
+            }
+
+            Token::ProcessingInstruction { target, data } => {
+                let parent = self.current();
+                self.doc.append_pi(parent, target, data.unwrap_or(""));
+            }
+
+            Token::Eof => {}
+
+            // Token is #[non_exhaustive] — future variants are ignored.
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Finalise the builder and return the completed [`Document`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::NoRootElement`] if no element was ever seen.
+    pub fn finish(self) -> Result<Document, BuildError> {
+        if !self.root_element_seen {
+            return Err(BuildError::NoRootElement);
+        }
+        Ok(self.doc)
+    }
+}
+
+impl Default for Builder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Raw attribute parser
+// ---------------------------------------------------------------------------
+
+/// Parse `name="value"` / `name='value'` pairs from a raw attribute string.
+///
+/// This is a lazy iterator — pairs are parsed on demand.  Invalid or
+/// malformed pairs are silently skipped (the tokenizer already validated
+/// basic well-formedness at the byte level).
+fn parse_raw_attrs(raw: &str) -> impl Iterator<Item = (&str, &str)> {
+    // Rust note: `core::iter::from_fn` lets us build a stateful iterator
+    // from a closure that captures mutable state — here `rest: &str`.
+    // The closure returns `Some(item)` to yield, `None` to stop.
+    let mut rest = raw.trim();
+    core::iter::from_fn(move || {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return None;
+        }
+
+        // Scan the attribute name (everything up to `=` or whitespace).
+        let name_end = rest.find(|c: char| c == '=' || c.is_ascii_whitespace())?;
+        let name = &rest[..name_end];
+        rest = rest[name_end..].trim_start();
+
+        // Expect `=`.
+        rest = rest.strip_prefix('=')?;
+        rest = rest.trim_start();
+
+        // Parse the quoted value.
+        let quote = rest.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        rest = &rest[quote.len_utf8()..]; // consume opening quote
+
+        let value_end = rest.find(quote)?;
+        let value = &rest[..value_end];
+        rest = &rest[value_end + quote.len_utf8()..]; // consume value + closing quote
+
+        Some((name, value))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper: build a document from an XML byte string.
+    fn build(xml: &[u8]) -> Result<Document, alloc::string::String> {
+        let mut tok = xml_tokenizer::Tokenizer::new(xml).map_err(|e| alloc::format!("{e:?}"))?;
+        let mut builder = Builder::new();
+        loop {
+            let token = tok.next_token().map_err(|e| alloc::format!("{e:?}"))?;
+            let done = token == xml_tokenizer::Token::Eof;
+            builder
+                .process_token(token)
+                .map_err(|e| alloc::format!("{e:?}"))?;
+            if done {
+                break;
+            }
+        }
+        builder.finish().map_err(|e| alloc::format!("{e:?}"))
+    }
+
+    // -----------------------------------------------------------------------
+    // Document::new
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn new_document_has_root() {
+        let doc = Document::new();
+        let root = doc.root();
+        assert_eq!(doc.kind(root), NodeKind::Document);
+        assert_eq!(doc.name(root), "#document");
+        assert!(doc.first_child(root).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Name interning
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn intern_name_same_string_same_id() {
+        let mut doc = Document::new();
+        let a = doc.intern_name("div");
+        let b = doc.intern_name("div");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn intern_name_different_strings_different_ids() {
+        let mut doc = Document::new();
+        let a = doc.intern_name("div");
+        let b = doc.intern_name("span");
+        assert_ne!(a, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tree mutation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn append_element() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let child = doc.append_element(root, "div");
+        assert_eq!(doc.kind(child), NodeKind::Element);
+        assert_eq!(doc.name(child), "div");
+        assert_eq!(doc.parent(child), Some(root));
+        assert_eq!(doc.first_child(root), Some(child));
+        assert_eq!(doc.last_child(root), Some(child));
+    }
+
+    #[test]
+    fn sibling_links() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let a = doc.append_element(root, "a");
+        let b = doc.append_element(root, "b");
+        let c = doc.append_element(root, "c");
+
+        // Forward chain
+        assert_eq!(doc.next_sibling(a), Some(b));
+        assert_eq!(doc.next_sibling(b), Some(c));
+        assert_eq!(doc.next_sibling(c), None);
+
+        // Backward chain
+        assert_eq!(doc.prev_sibling(c), Some(b));
+        assert_eq!(doc.prev_sibling(b), Some(a));
+        assert_eq!(doc.prev_sibling(a), None);
+
+        // Parent's first/last
+        assert_eq!(doc.first_child(root), Some(a));
+        assert_eq!(doc.last_child(root), Some(c));
+    }
+
+    #[test]
+    fn append_text() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let elem = doc.append_element(root, "p");
+        let txt = doc.append_text(elem, "hello");
+        assert_eq!(doc.kind(txt), NodeKind::Text);
+        assert_eq!(doc.value(txt), "hello");
+        assert_eq!(doc.name(txt), "#text");
+    }
+
+    #[test]
+    fn append_comment() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let c = doc.append_comment(root, " a comment ");
+        assert_eq!(doc.kind(c), NodeKind::Comment);
+        assert_eq!(doc.value(c), " a comment ");
+        assert_eq!(doc.name(c), "#comment");
+    }
+
+    #[test]
+    fn append_cdata() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let e = doc.append_element(root, "r");
+        let cd = doc.append_cdata(e, "<raw>");
+        assert_eq!(doc.kind(cd), NodeKind::CData);
+        assert_eq!(doc.value(cd), "<raw>");
+        assert_eq!(doc.name(cd), "#cdata-section");
+    }
+
+    #[test]
+    fn append_pi() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let pi = doc.append_pi(root, "xml-stylesheet", "href=\"style.css\"");
+        assert_eq!(doc.kind(pi), NodeKind::Pi);
+        assert_eq!(doc.name(pi), "xml-stylesheet");
+        assert_eq!(doc.value(pi), "href=\"style.css\"");
+    }
+
+    #[test]
+    fn add_attr() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let elem = doc.append_element(root, "a");
+        doc.add_attr(elem, "href", "https://example.com");
+        doc.add_attr(elem, "class", "link");
+
+        let attrs = doc.attrs(elem);
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(doc.attr_name(&attrs[0]), "href");
+        assert_eq!(doc.attr_value(&attrs[0]), "https://example.com");
+        assert_eq!(doc.attr_name(&attrs[1]), "class");
+        assert_eq!(doc.attr_value(&attrs[1]), "link");
+    }
+
+    // -----------------------------------------------------------------------
+    // ChildIter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn children_iterator() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let a = doc.append_element(root, "a");
+        let b = doc.append_element(root, "b");
+        let c = doc.append_element(root, "c");
+
+        let ids: Vec<NodeId> = doc.children(root).collect();
+        assert_eq!(ids, vec![a, b, c]);
+    }
+
+    #[test]
+    fn children_of_leaf_is_empty() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let e = doc.append_element(root, "leaf");
+        assert_eq!(doc.children(e).count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Builder
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn builder_simple_element() {
+        let doc = build(b"<root/>").unwrap();
+        let root_elem = doc.first_child(doc.root()).unwrap();
+        assert_eq!(doc.name(root_elem), "root");
+        assert_eq!(doc.kind(root_elem), NodeKind::Element);
+    }
+
+    #[test]
+    fn builder_nested_elements() {
+        let doc = build(b"<a><b><c/></b></a>").unwrap();
+        let a = doc.first_child(doc.root()).unwrap();
+        let b = doc.first_child(a).unwrap();
+        let c = doc.first_child(b).unwrap();
+        assert_eq!(doc.name(a), "a");
+        assert_eq!(doc.name(b), "b");
+        assert_eq!(doc.name(c), "c");
+        assert_eq!(doc.first_child(c), None);
+    }
+
+    #[test]
+    fn builder_text_content() {
+        let doc = build(b"<p>hello world</p>").unwrap();
+        let p = doc.first_child(doc.root()).unwrap();
+        let txt = doc.first_child(p).unwrap();
+        assert_eq!(doc.kind(txt), NodeKind::Text);
+        assert_eq!(doc.value(txt), "hello world");
+    }
+
+    #[test]
+    fn builder_attributes() {
+        let doc = build(b"<a href=\"x\" class=\"y\"/>").unwrap();
+        let a = doc.first_child(doc.root()).unwrap();
+        let attrs = doc.attrs(a);
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(doc.attr_name(&attrs[0]), "href");
+        assert_eq!(doc.attr_value(&attrs[0]), "x");
+        assert_eq!(doc.attr_name(&attrs[1]), "class");
+        assert_eq!(doc.attr_value(&attrs[1]), "y");
+    }
+
+    #[test]
+    fn builder_comment_and_pi() {
+        let doc = build(b"<r><!-- hi --><?foo bar?></r>").unwrap();
+        let r = doc.first_child(doc.root()).unwrap();
+        let children: Vec<_> = doc.children(r).collect();
+        assert_eq!(children.len(), 2);
+        assert_eq!(doc.kind(children[0]), NodeKind::Comment);
+        assert_eq!(doc.value(children[0]), " hi ");
+        assert_eq!(doc.kind(children[1]), NodeKind::Pi);
+        assert_eq!(doc.name(children[1]), "foo");
+        assert_eq!(doc.value(children[1]), "bar");
+    }
+
+    #[test]
+    fn builder_cdata() {
+        let doc = build(b"<r><![CDATA[<b>raw</b>]]></r>").unwrap();
+        let r = doc.first_child(doc.root()).unwrap();
+        let cd = doc.first_child(r).unwrap();
+        assert_eq!(doc.kind(cd), NodeKind::CData);
+        assert_eq!(doc.value(cd), "<b>raw</b>");
+    }
+
+    #[test]
+    fn builder_xml_decl_accepted() {
+        let doc = build(b"<?xml version=\"1.0\"?><root/>").unwrap();
+        // XML decl generates no tree node — root element is the first child.
+        let elem = doc.first_child(doc.root()).unwrap();
+        assert_eq!(doc.name(elem), "root");
+    }
+
+    #[test]
+    fn builder_no_root_element_is_error() {
+        let mut builder = Builder::new();
+        builder.process_token(xml_tokenizer::Token::Eof).unwrap();
+        assert!(matches!(builder.finish(), Err(BuildError::NoRootElement)));
+    }
+
+    #[test]
+    fn builder_siblings_preserved() {
+        let doc = build(b"<r><a/><b/><c/></r>").unwrap();
+        let r = doc.first_child(doc.root()).unwrap();
+        let names: Vec<&str> = doc.children(r).map(|id| doc.name(id)).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_raw_attrs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_attrs_double_quoted() {
+        let pairs: Vec<_> = parse_raw_attrs(r#"id="main" class="x y""#).collect();
+        assert_eq!(pairs, [("id", "main"), ("class", "x y")]);
+    }
+
+    #[test]
+    fn parse_attrs_single_quoted() {
+        let pairs: Vec<_> = parse_raw_attrs("href='x' title='y'").collect();
+        assert_eq!(pairs, [("href", "x"), ("title", "y")]);
+    }
+
+    #[test]
+    fn parse_attrs_empty() {
+        let pairs: Vec<_> = parse_raw_attrs("").collect();
+        assert!(pairs.is_empty());
+    }
+}
