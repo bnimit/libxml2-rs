@@ -619,7 +619,14 @@ fn collect_subtree_data(doc: &Document, node: NodeId) -> NodeCopy {
         .children(node)
         .map(|c| collect_subtree_data(doc, c))
         .collect();
-    NodeCopy { kind, name, ns, value, attrs, children }
+    NodeCopy {
+        kind,
+        name,
+        ns,
+        value,
+        attrs,
+        children,
+    }
 }
 
 /// Phase 2 — paste `copy` as the last child of `parent`, returning the new node.
@@ -732,7 +739,12 @@ impl Document {
         let insert_pos = self.nodes[elem.0 as usize].attrs_end as usize;
         self.attrs.insert(
             insert_pos,
-            AttrData { name: name_id, ns: ns_id, value_offset: vo, value_len: vl },
+            AttrData {
+                name: name_id,
+                ns: ns_id,
+                value_offset: vo,
+                value_len: vl,
+            },
         );
         self.fixup_attrs_after_insert(insert_pos as u32, elem);
     }
@@ -2289,10 +2301,9 @@ mod tests {
 
     #[test]
     fn copy_subtree_namespace_preserved() {
-        let mut doc = build(
-            b"<root xmlns:svg=\"http://www.w3.org/2000/svg\"><svg:circle r=\"5\"/></root>",
-        )
-        .unwrap();
+        let mut doc =
+            build(b"<root xmlns:svg=\"http://www.w3.org/2000/svg\"><svg:circle r=\"5\"/></root>")
+                .unwrap();
         let root_elem = doc.first_child(doc.root()).unwrap();
         let circle = doc.first_child(root_elem).unwrap();
 
