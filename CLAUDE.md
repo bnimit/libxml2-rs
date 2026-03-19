@@ -112,4 +112,4 @@ cargo bench -p xml-tree                          # benchmarks
 
 ## MSRV
 
-**Rust 1.81** — stabilised `core::error::Error`. Do not use features from later versions without updating the MSRV in `Cargo.toml` and the CI matrix.
+**Rust 1.85** — minimum version that supports Rust edition 2024 (required by transitive dependencies via `clap`/`criterion`). Do not use features from later versions without updating the MSRV in `Cargo.toml` and the CI matrix.

@@ -284,7 +284,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.81"         # MSRV: core::error::Error stable
+rust-version = "1.85"         # MSRV: Rust edition 2024 support
 license = "Apache-2.0"
 repository = "https://github.com/ibm/libxml2-rs"
 homepage = "https://ibm.github.io/libxml2-rs"
