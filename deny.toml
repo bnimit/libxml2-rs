@@ -8,8 +8,8 @@ all-features = false
 [advisories]
 version = 2
 vulnerability = "deny"
-unsound = "deny"
-unmaintained = "warn"
+unsound = "all"
+unmaintained = "all"
 yanked = "deny"
 
 [licenses]
