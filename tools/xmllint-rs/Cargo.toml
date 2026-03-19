@@ -10,6 +10,8 @@ homepage.workspace    = true
 
 [[bin]]
 name = "xmllint"
+path = "src/main.rs"
+path = "src/main.rs"
 
 [dependencies]
 libxml2-rs = { path = "../../crates/libxml2-rs" }
