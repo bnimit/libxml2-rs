@@ -123,28 +123,33 @@ pub fn parse_bytes(input: &[u8], _opts: &ParserOptions) -> Result<Document, Pars
     loop {
         let token = tokenizer.next_token().map_err(token_err_to_parse_err)?;
         let done = token == xml_tokenizer::Token::Eof;
-        builder.process_token(token).map_err(|e| match e {
-            xml_tree::BuildError::NoRootElement => ParseError::NoRootElement,
-            xml_tree::BuildError::UnexpectedEndTag => ParseError::NotWellFormed {
-                offset: 0,
-                message: "unexpected end tag",
-            },
-        })?;
+        builder
+            .process_token(token)
+            .map_err(build_err_to_parse_err)?;
         if done {
             break;
         }
     }
 
     // Step 3 — finalise and wrap.
-    let inner = builder.finish().map_err(|e| match e {
+    let inner = builder.finish().map_err(build_err_to_parse_err)?;
+
+    Ok(Document { inner })
+}
+
+/// Convert a [`xml_tree::BuildError`] to a [`ParseError`].
+fn build_err_to_parse_err(e: xml_tree::BuildError) -> ParseError {
+    match e {
         xml_tree::BuildError::NoRootElement => ParseError::NoRootElement,
         xml_tree::BuildError::UnexpectedEndTag => ParseError::NotWellFormed {
             offset: 0,
             message: "unexpected end tag",
         },
-    })?;
-
-    Ok(Document { inner })
+        xml_tree::BuildError::UnboundNamespacePrefix(_) => ParseError::NotWellFormed {
+            offset: 0,
+            message: "unbound namespace prefix",
+        },
+    }
 }
 
 /// Convert a [`xml_tokenizer::TokenError`] to a [`ParseError`].
