@@ -14,7 +14,7 @@ This project is a **complete, drop-in replacement**:
 
 ## Status
 
-> **This project is in the architecture and early implementation phase.**
+> **Phase 1 is complete. Phase 2 is in active development.**
 > We are actively seeking contributors, reviewers, and domain experts.
 
 See [docs/architecture/overview.md](docs/architecture/overview.md) for the full technical design.
@@ -23,10 +23,20 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Phase | Scope | Status |
 |---|---|---|
-| 1 — Core Parser | XML 1.0, SAX2, mutable DOM, serialization | 🔲 Planning |
-| 2 — Extended | XPath 1.0, DTD validation, Reader/Writer, HTML, C ABI | 🔲 Planning |
-| 3 — Validation | XSD, RelaxNG, XInclude, C14N, Catalogs | 🔲 Planning |
-| 4 — XSLT + Maturity | XSLT 1.0, Schematron, full C ABI parity, security audit | 🔲 Planning |
+| 1 — Core Parser | XML 1.0 tokenizer, namespace resolution, arena DOM, entity decoding, encoding transcoding, serialization | ✅ Complete |
+| 2 — Extended | XPath 1.0, DTD validation, Reader/Writer, HTML5, C ABI | 🔧 In Progress |
+| 3 — Validation | XSD, RelaxNG, XInclude, C14N, Catalogs | 🔲 Planned |
+| 4 — XSLT + Maturity | XSLT 1.0, Schematron, full C ABI parity, security audit | 🔲 Planned |
+
+### What's implemented (Phase 1)
+
+| Crate | What works |
+|---|---|
+| `xml-chars` | Unicode XML 1.0 §2.2 character class tables |
+| `xml-tokenizer` | Zero-copy byte scanner; emits SAX2-style tokens; UTF-8 BOM stripping |
+| `xml-ns` | `NsResolver` scope stack; prefix→URI lookup; `QName` resolution |
+| `xml-tree` | Arena DOM (`NodeId` index tree); `Builder` from token stream; namespace-aware elements and attributes; entity/character-reference decoding (`&amp;`, `&#xNN;`, …); `to_xml_string` / `serialize_node` / `write_xml` serialization |
+| `libxml2-rs` | `parse_bytes` / `parse_str` / `parse_file` / `parse_reader`; `ParserOptions` with secure defaults; encoding detection and transcoding (UTF-16 LE/BE BOM, XML declaration sniff, `encoding_rs`); `Document::to_xml_string` / `to_xml_string_formatted` / `write_xml` |
 
 ## Design Highlights
 
@@ -59,25 +69,41 @@ tools/
 
 ## Getting Started
 
-> The library is not yet published to crates.io. Once Phase 1 is complete, it will be available as `libxml2-rs`.
+> The library is not yet published to crates.io. Add it as a path dependency from a workspace checkout.
 
 ```toml
-# Cargo.toml (future)
+# Cargo.toml (path dep until crates.io publish)
 [dependencies]
-libxml2-rs = "0.1"
+libxml2-rs = { path = "path/to/libxml2-rs/crates/libxml2-rs" }
 ```
 
 ```rust
-use libxml2_rs::Document;
+use libxml2_rs::{parse_str, ParserOptions};
 
-let doc = Document::parse_str("<root><child id=\"1\">hello</child></root>")?;
-let root = doc.root_element().unwrap();
-println!("Root: {}", root.name());    // "root"
+let doc = parse_str(
+    r#"<root><child id="1">hello</child></root>"#,
+    &ParserOptions::default(),
+)?;
 
-for child in root.children() {
-    println!("  {}: {}", child.name(), child.text().unwrap_or(""));
+let tree = doc.tree();
+let root = tree.first_child(doc.root()).unwrap();
+println!("Root: {}", tree.name(root)); // "root"
+
+for child in tree.children(root) {
+    let text = tree.first_child(child)
+        .map(|t| tree.value(t))
+        .unwrap_or("");
+    println!("  {}: {}", tree.name(child), text); // "  child: hello"
 }
+
+// Serialize back to XML
+println!("{}", doc.to_xml_string());
+// → <root><child id="1">hello</child></root>
 ```
+
+### Secure defaults
+
+`ParserOptions::default()` is safe out of the box — XXE is off, entity expansion is capped, and nesting depth is limited. Use `ParserOptions::libxml2_compat()` only in tests that need full compatibility with the reference implementation.
 
 ## Contributing
 
