@@ -2,3 +2,8 @@
 Cargo.lock
 *.orig
 .DS_Store
+
+# Downloaded test suites — fetched automatically on first test run
+/tests/xmlconf/*
+!/tests/xmlconf/.gitkeep
+/tests/*.tar.gz

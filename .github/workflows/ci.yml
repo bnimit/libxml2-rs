@@ -93,8 +93,6 @@ jobs:
     if: github.event_name == 'push'   # nightly on main only, not every PR
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive         # conformance test suites are submodules
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
