@@ -1,0 +1,56 @@
+name: Bug Report
+description: Report incorrect behavior or a crash
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please fill in as much detail as you can.
+
+  - type: input
+    id: crate
+    attributes:
+      label: Affected crate
+      placeholder: "e.g. xml-tokenizer, xml-tree, xml-xpath"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: "e.g. 0.1.0 or git SHA"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What did you expect to happen, and what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: A small XML document and/or Rust code that demonstrates the issue.
+      render: rust
+    validations:
+      required: true
+
+  - type: textarea
+    id: libxml2_behavior
+    attributes:
+      label: libxml2 reference behavior (if applicable)
+      description: |
+        If you know how the C libxml2 behaves on the same input, please describe it.
+        This helps us determine if this is a bug or an intentional behavioral difference.
+
+  - type: checkboxes
+    id: security
+    attributes:
+      label: Security
+      options:
+        - label: This bug has security implications — I will follow the process in SECURITY.md instead

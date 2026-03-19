@@ -1,0 +1,17 @@
+[package]
+name        = "xml-ns"
+description = "XML namespace URI and prefix types for libxml2-rs (no_std + alloc)"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace = true
+license.workspace     = true
+repository.workspace  = true
+homepage.workspace    = true
+
+[features]
+default = ["std"]
+std     = []
+
+[dependencies]
+
+[dev-dependencies]

@@ -1,0 +1,14 @@
+[package]
+name        = "xml-chars"
+description = "Unicode XML character class tables for libxml2-rs (no_std, no alloc)"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace = true
+license.workspace     = true
+repository.workspace  = true
+homepage.workspace    = true
+
+[features]
+default = []
+
+[dev-dependencies]

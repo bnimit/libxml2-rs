@@ -1,0 +1,21 @@
+[package]
+name        = "libxml2-rs-c"
+description = "C ABI compatibility layer for libxml2-rs — drop-in replacement for libxml2.so"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace = true
+license.workspace     = true
+repository.workspace  = true
+homepage.workspace    = true
+
+[lib]
+name       = "xml2"          # produces libxml2.so / libxml2.a
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+libxml2-rs = { path = "../libxml2-rs" }
+
+[build-dependencies]
+cbindgen = { workspace = true }
+
+[dev-dependencies]

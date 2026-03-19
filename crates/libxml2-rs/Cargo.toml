@@ -1,0 +1,13 @@
+[package]
+name        = "libxml2-rs"
+description = "libxml2-rs unified public API — part of libxml2-rs"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace = true
+license.workspace     = true
+repository.workspace  = true
+homepage.workspace    = true
+
+[dependencies]
+
+[dev-dependencies]

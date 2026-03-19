@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/xml-chars",
+    "crates/xml-tokenizer",
+    "crates/xml-ns",
+    "crates/xml-tree",
+    "crates/xml-xpath",
+    "crates/xml-schema",
+    "crates/xml-relaxng",
+    "crates/xml-xinclude",
+    "crates/xml-c14n",
+    "crates/xml-catalog",
+    "crates/html-parser",
+    "crates/libxml2-rs",
+    "crates/libxml2-rs-c",
+    "tools/xmllint-rs",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.81"
+license      = "Apache-2.0"
+repository   = "https://github.com/bnimit/libxml2-rs"
+homepage     = "https://github.com/bnimit/libxml2-rs"
+authors      = []
+
+[workspace.dependencies]
+# Scanning / parsing
+memchr      = "2.7"
+encoding_rs = "0.8"
+
+# Allocation / data structures
+bumpalo  = { version = "3.16", features = ["collections"] }
+indexmap = "2"
+smallvec = { version = "1", features = ["union", "const_generics"] }
+
+# Error handling
+thiserror = "2"
+
+# Logging
+log = "0.4"
+
+# HTML parsing (Phase 2+)
+html5ever   = "0.29"
+markup5ever = "0.14"
+
+# Async (optional)
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+
+# C ABI generation (build-time)
+cbindgen = "0.27"
+
+# Testing
+proptest         = "1"
+criterion        = { version = "0.5", features = ["html_reports"] }
+libfuzzer-sys    = "0.4"
+
+[profile.release]
+lto            = "fat"
+codegen-units  = 1
+panic          = "abort"
+
+[profile.bench]
+inherits = "release"
+debug    = true

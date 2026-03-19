@@ -1,0 +1,19 @@
+# CODEOWNERS
+# Each line assigns review ownership for a path.
+# The rightmost matching rule takes precedence.
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default: any maintainer can review
+*                               @bnimit
+
+# Core crates — require review from project lead
+crates/xml-chars/               @bnimit
+crates/xml-tokenizer/           @bnimit
+crates/xml-tree/                @bnimit
+
+# C ABI layer — security-sensitive, require project lead sign-off
+crates/libxml2-rs-c/            @bnimit
+
+# Governance and community health files
+SECURITY.md                     @bnimit
+MAINTAINERS.md                  @bnimit

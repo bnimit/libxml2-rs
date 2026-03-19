@@ -1,0 +1,43 @@
+name: Feature Request
+description: Request a missing libxml2 API or new functionality
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please check `docs/architecture/overview.md` to see if
+        your feature is already planned in a later phase.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What would you like?
+      description: Describe the feature and the use case it enables.
+    validations:
+      required: true
+
+  - type: textarea
+    id: libxml2_api
+    attributes:
+      label: Corresponding libxml2 C API (if applicable)
+      description: |
+        The libxml2 function(s) this feature corresponds to, e.g. `xmlXIncludeProcess`.
+      render: c
+
+  - type: textarea
+    id: proposed_api
+    attributes:
+      label: Proposed Rust API (optional)
+      description: A sketch of what the Rust API might look like.
+      render: rust
+
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Which roadmap phase does this belong to?
+      options:
+        - "Phase 1 — Core parser"
+        - "Phase 2 — XPath / DTD / Reader / Writer"
+        - "Phase 3 — XSD / RelaxNG / XInclude / C14N"
+        - "Phase 4 — XSLT / Schematron"
+        - "Not sure"

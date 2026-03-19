@@ -1,0 +1,19 @@
+[package]
+name        = "xml-tokenizer"
+description = "Zero-copy XML 1.0 tokenizer for libxml2-rs (no_std + alloc)"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace = true
+license.workspace     = true
+repository.workspace  = true
+homepage.workspace    = true
+
+[features]
+default = ["std"]
+std     = []
+
+[dependencies]
+xml-chars = { path = "../xml-chars" }
+memchr    = { workspace = true }
+
+[dev-dependencies]

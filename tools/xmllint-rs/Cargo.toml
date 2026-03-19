@@ -1,0 +1,17 @@
+[package]
+name        = "xmllint-rs"
+description = "xmllint-compatible command-line tool backed by libxml2-rs"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace = true
+license.workspace     = true
+repository.workspace  = true
+homepage.workspace    = true
+
+[[bin]]
+name = "xmllint"
+
+[dependencies]
+libxml2-rs = { path = "../../crates/libxml2-rs" }
+
+[dev-dependencies]
