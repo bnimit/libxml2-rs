@@ -247,9 +247,12 @@ impl Document {
 /// assert_eq!(tree.name(root_elem), "root");
 /// ```
 pub fn parse_bytes(input: &[u8], _opts: &ParserOptions) -> Result<Document, ParseError> {
-    // Step 1 — create the tokenizer.  This validates UTF-8 upfront and strips
+    // Step 1 — transcode to UTF-8 if needed (zero-copy for plain UTF-8 input).
+    let utf8 = transcode_to_utf8(input)?;
+
+    // Step 2 — create the tokenizer.  This validates UTF-8 upfront and strips
     // the BOM so the rest of the pipeline only sees clean UTF-8.
-    let mut tokenizer = xml_tokenizer::Tokenizer::new(input).map_err(|e| match e {
+    let mut tokenizer = xml_tokenizer::Tokenizer::new(&utf8).map_err(|e| match e {
         xml_tokenizer::TokenError::InvalidUtf8 => ParseError::InvalidUtf8,
         _ => ParseError::NotWellFormed {
             offset: 0,
@@ -257,7 +260,7 @@ pub fn parse_bytes(input: &[u8], _opts: &ParserOptions) -> Result<Document, Pars
         },
     })?;
 
-    // Step 2 — feed every token into the tree builder.
+    // Step 3 — feed every token into the tree builder.
     let mut builder = xml_tree::Builder::new();
     loop {
         let token = tokenizer.next_token().map_err(token_err_to_parse_err)?;
@@ -270,7 +273,7 @@ pub fn parse_bytes(input: &[u8], _opts: &ParserOptions) -> Result<Document, Pars
         }
     }
 
-    // Step 3 — finalise and wrap.
+    // Step 4 — finalise and wrap.
     let inner = builder.finish().map_err(build_err_to_parse_err)?;
 
     Ok(Document { inner })
@@ -367,6 +370,102 @@ pub fn parse_reader<R: Read>(mut reader: R, opts: &ParserOptions) -> Result<Docu
 }
 
 // ---------------------------------------------------------------------------
+// Encoding detection and transcoding
+// ---------------------------------------------------------------------------
+
+/// Transcode `input` to UTF-8, returning a zero-copy `Cow::Borrowed` when the
+/// input is already UTF-8 (with or without BOM) and `Cow::Owned` when it had
+/// to be transcoded from another encoding.
+///
+/// Detection order:
+/// 1. BOM — `encoding_rs::Encoding::for_bom` covers UTF-8, UTF-16 LE, UTF-16 BE.
+/// 2. XML declaration `encoding="…"` sniff for ASCII-compatible encodings.
+/// 3. Default: assume UTF-8.
+fn transcode_to_utf8(input: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, ParseError> {
+    // ── 1. BOM detection ────────────────────────────────────────────────────
+    if let Some((enc, bom_len)) = encoding_rs::Encoding::for_bom(input) {
+        if enc == encoding_rs::UTF_8 {
+            // UTF-8 BOM: the tokenizer already strips it; pass through as-is.
+            return Ok(std::borrow::Cow::Borrowed(input));
+        }
+        // UTF-16 LE or BE: transcode the post-BOM bytes.
+        let (decoded, _, had_errors) = enc.decode(&input[bom_len..]);
+        if had_errors {
+            return Err(ParseError::NotWellFormed {
+                offset: 0,
+                message: format!("encoding error while transcoding {} input", enc.name()),
+            });
+        }
+        return Ok(std::borrow::Cow::Owned(decoded.into_owned().into_bytes()));
+    }
+
+    // ── 2. XML declaration sniff ─────────────────────────────────────────────
+    if let Some(label) = sniff_xml_encoding_label(input) {
+        if let Some(enc) = encoding_rs::Encoding::for_label(label.as_bytes()) {
+            if enc != encoding_rs::UTF_8 {
+                let (decoded, actual_enc, had_errors) = enc.decode(input);
+                if had_errors {
+                    return Err(ParseError::NotWellFormed {
+                        offset: 0,
+                        message: format!("encoding error while transcoding {} input", enc.name()),
+                    });
+                }
+                // Warn if the decoder auto-detected a different encoding.
+                if actual_enc != enc {
+                    log::warn!(
+                        "declared encoding {label:?} but content detected as {}",
+                        actual_enc.name()
+                    );
+                }
+                return Ok(std::borrow::Cow::Owned(decoded.into_owned().into_bytes()));
+            }
+        } else {
+            log::warn!("unknown encoding label {label:?}; proceeding as UTF-8");
+        }
+    }
+
+    // ── 3. Default: UTF-8 (zero copy) ────────────────────────────────────────
+    Ok(std::borrow::Cow::Borrowed(input))
+}
+
+/// Scan the first 256 bytes of `input` for an ASCII-compatible XML declaration
+/// and return the declared `encoding` label if found.
+///
+/// Only works for encodings that are ASCII-compatible in the first few bytes
+/// (UTF-8, ISO-8859-*, Windows-125x, …).  UTF-16 without a BOM is not handled
+/// here — those documents should carry a BOM.
+fn sniff_xml_encoding_label(input: &[u8]) -> Option<String> {
+    // Only scan the first 256 bytes; an XML declaration must appear right at
+    // the start of the document.
+    let head = &input[..input.len().min(256)];
+    // Must start with `<?xml` (ASCII-compatible).
+    if !head.starts_with(b"<?xml") {
+        return None;
+    }
+    // Find `?>` in the raw bytes — the XML declaration is always pure ASCII
+    // so we can scan for it even in non-UTF-8 documents.
+    let decl_end = head.windows(2).position(|w| w == b"?>")?;
+    // The XML declaration content is guaranteed ASCII — from_utf8 will succeed.
+    let decl_bytes = &head[..decl_end];
+    let decl = std::str::from_utf8(decl_bytes).ok()?;
+    // Find `encoding` pseudo-attribute.
+    let enc_start = decl.find("encoding")?;
+    let after = &decl[enc_start + 8..];
+    // Skip optional whitespace and the `=`.
+    let after = after.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let after = after.strip_prefix('=')?;
+    let after = after.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    // Expect an opening quote.
+    let quote = after.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let label_rest = &after[1..];
+    let end = label_rest.find(quote)?;
+    Some(label_rest[..end].to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Internal error converters
 // ---------------------------------------------------------------------------
 
@@ -436,7 +535,8 @@ mod tests {
 
     #[test]
     fn invalid_utf8_returns_error() {
-        let result = parse_bytes(b"\xff\xfe", &ParserOptions::default());
+        // 0x80 is a lone continuation byte — not valid UTF-8 and not a BOM.
+        let result = parse_bytes(b"\x80text", &ParserOptions::default());
         assert!(matches!(result, Err(ParseError::InvalidUtf8)));
     }
 
@@ -521,5 +621,84 @@ mod tests {
             ParseError::Io("broken pipe".into()).to_string(),
             "I/O error: broken pipe"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Encoding detection and transcoding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn utf8_bom_document_parses() {
+        // UTF-8 BOM followed by a well-formed document.
+        let xml = b"\xef\xbb\xbf<root/>";
+        let doc = parse_bytes(xml, &ParserOptions::default()).unwrap();
+        let tree = doc.tree();
+        let elem = tree.first_child(doc.root()).unwrap();
+        assert_eq!(tree.name(elem), "root");
+    }
+
+    #[test]
+    fn utf16_le_bom_document_parses() {
+        // Build a minimal UTF-16 LE document: BOM + `<r/>` encoded as UTF-16 LE.
+        let mut utf16le: Vec<u8> = vec![0xFF, 0xFE]; // LE BOM
+        for ch in "<r/>".encode_utf16() {
+            utf16le.push(ch as u8);
+            utf16le.push((ch >> 8) as u8);
+        }
+        let doc = parse_bytes(&utf16le, &ParserOptions::default()).unwrap();
+        let tree = doc.tree();
+        let elem = tree.first_child(doc.root()).unwrap();
+        assert_eq!(tree.name(elem), "r");
+    }
+
+    #[test]
+    fn utf16_be_bom_document_parses() {
+        // Build a minimal UTF-16 BE document: BOM + `<r/>` encoded as UTF-16 BE.
+        let mut utf16be: Vec<u8> = vec![0xFE, 0xFF]; // BE BOM
+        for ch in "<r/>".encode_utf16() {
+            utf16be.push((ch >> 8) as u8);
+            utf16be.push(ch as u8);
+        }
+        let doc = parse_bytes(&utf16be, &ParserOptions::default()).unwrap();
+        let tree = doc.tree();
+        let elem = tree.first_child(doc.root()).unwrap();
+        assert_eq!(tree.name(elem), "r");
+    }
+
+    #[test]
+    fn iso_8859_1_document_transcodes() {
+        // ISO-8859-1: `é` = 0xE9.  We include it in a text node.
+        // The document declares encoding="ISO-8859-1".
+        let mut doc_bytes =
+            b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><p>caf\xe9</p>".to_vec();
+        // Ensure the byte is present (it is: \xe9 = é in Latin-1).
+        let doc = parse_bytes(&doc_bytes, &ParserOptions::default()).unwrap();
+        let tree = doc.tree();
+        let p = tree.first_child(doc.root()).unwrap();
+        let txt = tree.first_child(p).unwrap();
+        assert_eq!(tree.value(txt), "café");
+        // Make the borrow checker happy (suppress unused warning).
+        doc_bytes.clear();
+    }
+
+    #[test]
+    fn plain_utf8_no_allocation() {
+        // The fast path: plain UTF-8, no BOM, no encoding decl → Cow::Borrowed.
+        use std::borrow::Cow;
+        let input = b"<root/>";
+        let result = transcode_to_utf8(input).unwrap();
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn sniff_xml_encoding_label_finds_label() {
+        let xml = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r/>";
+        assert_eq!(sniff_xml_encoding_label(xml).as_deref(), Some("ISO-8859-1"));
+    }
+
+    #[test]
+    fn sniff_xml_encoding_label_none_without_decl() {
+        let xml = b"<root/>";
+        assert_eq!(sniff_xml_encoding_label(xml), None);
     }
 }
