@@ -119,7 +119,14 @@ fn verify_sha256(file: &Path, expected_hex: &str) {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Output format: "<hex>  <path>"
-    let actual_hex = stdout.split_whitespace().next().unwrap_or("");
+    // On Windows, sha256sum (GNU coreutils via Git Bash) prefixes the hash
+    // with `\` when the file path contains backslashes, to signal escaping.
+    // Strip that leading backslash before comparing.
+    let actual_hex = stdout
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('\\');
 
     assert_eq!(
         actual_hex,
