@@ -1,12 +1,7 @@
 //! libxml2-rs — unified public API for the libxml2-rs workspace.
 //!
 //! See `docs/architecture/overview.md` for the full design.
-//!
-//! **Status (Phase 1):** Stub types and API only — no parsing logic yet.
-//! Tracking issue: <https://github.com/your-org/libxml2-rs/issues/5>
 #![warn(missing_docs)]
-// TODO(Phase 1): remove once all stubs are wired up
-#![allow(dead_code)]
 
 /// Options that control the XML parser's behaviour.
 ///
@@ -52,6 +47,8 @@ pub enum ParseError {
         /// Human-readable description of the problem.
         message: &'static str,
     },
+    /// The document contains no root element.
+    NoRootElement,
 }
 
 impl core::fmt::Display for ParseError {
@@ -61,40 +58,152 @@ impl core::fmt::Display for ParseError {
             ParseError::NotWellFormed { offset, message } => {
                 write!(f, "not well-formed at byte {offset}: {message}")
             }
+            ParseError::NoRootElement => write!(f, "document has no root element"),
         }
     }
 }
 
 /// A parsed XML document.
 ///
-/// This is currently a stub — it will wrap `xml_tree::Document` once the
-/// tree crate is wired in (Phase 1, Issue #3).
-#[derive(Debug)]
+/// Wraps [`xml_tree::Document`] — an arena-based DOM where all nodes are
+/// stored in a flat `Vec` and referenced by integer [`xml_tree::NodeId`]s.
 pub struct Document {
-    // TODO(Phase 1): replace with xml_tree::Document
-    _private: (),
+    inner: xml_tree::Document,
+}
+
+impl Document {
+    /// The document root node.
+    pub fn root(&self) -> xml_tree::NodeId {
+        self.inner.root()
+    }
+
+    /// Access the underlying [`xml_tree::Document`] for traversal.
+    pub fn tree(&self) -> &xml_tree::Document {
+        &self.inner
+    }
 }
 
 /// Parse a UTF-8 XML document from a byte slice.
 ///
+/// Drives the zero-copy tokenizer ([`xml_tokenizer`]) and the arena tree
+/// builder ([`xml_tree::Builder`]) to produce a [`Document`].
+///
 /// # Errors
 ///
-/// Returns [`ParseError::InvalidUtf8`] if `input` is not valid UTF-8, or
-/// [`ParseError::NotWellFormed`] if the XML is malformed.
+/// | Error | Cause |
+/// |---|---|
+/// | [`ParseError::InvalidUtf8`] | Input is not valid UTF-8 |
+/// | [`ParseError::NotWellFormed`] | Structural XML error (unclosed tag, illegal character, …) |
+/// | [`ParseError::NoRootElement`] | Document is empty or contains only declarations |
 ///
 /// # Example
 ///
 /// ```rust
 /// use libxml2_rs::{parse_bytes, ParserOptions};
 ///
-/// let xml = b"<?xml version=\"1.0\"?><root/>";
-/// // This currently returns Err because the tokenizer is not yet implemented.
-/// let _result = parse_bytes(xml, &ParserOptions::default());
+/// let xml = b"<?xml version=\"1.0\"?><root><child/></root>";
+/// let doc = parse_bytes(xml, &ParserOptions::default()).unwrap();
+/// let tree = doc.tree();
+/// let root_elem = tree.first_child(doc.root()).unwrap();
+/// assert_eq!(tree.name(root_elem), "root");
 /// ```
-pub fn parse_bytes(_input: &[u8], _opts: &ParserOptions) -> Result<Document, ParseError> {
-    // TODO(Phase 1): drive xml_tokenizer + xml_tree here
-    Err(ParseError::NotWellFormed {
-        offset: 0,
-        message: "parser not yet implemented",
-    })
+pub fn parse_bytes(input: &[u8], _opts: &ParserOptions) -> Result<Document, ParseError> {
+    // Step 1 — create the tokenizer.  This validates UTF-8 upfront and strips
+    // the BOM so the rest of the pipeline only sees clean UTF-8.
+    let mut tokenizer = xml_tokenizer::Tokenizer::new(input).map_err(|e| match e {
+        xml_tokenizer::TokenError::InvalidUtf8 => ParseError::InvalidUtf8,
+        _ => ParseError::NotWellFormed {
+            offset: 0,
+            message: "tokenizer initialisation failed",
+        },
+    })?;
+
+    // Step 2 — feed every token into the tree builder.
+    let mut builder = xml_tree::Builder::new();
+    loop {
+        let token = tokenizer.next_token().map_err(token_err_to_parse_err)?;
+        let done = token == xml_tokenizer::Token::Eof;
+        builder.process_token(token).map_err(|e| match e {
+            xml_tree::BuildError::NoRootElement => ParseError::NoRootElement,
+            xml_tree::BuildError::UnexpectedEndTag => ParseError::NotWellFormed {
+                offset: 0,
+                message: "unexpected end tag",
+            },
+        })?;
+        if done {
+            break;
+        }
+    }
+
+    // Step 3 — finalise and wrap.
+    let inner = builder.finish().map_err(|e| match e {
+        xml_tree::BuildError::NoRootElement => ParseError::NoRootElement,
+        xml_tree::BuildError::UnexpectedEndTag => ParseError::NotWellFormed {
+            offset: 0,
+            message: "unexpected end tag",
+        },
+    })?;
+
+    Ok(Document { inner })
+}
+
+/// Convert a [`xml_tokenizer::TokenError`] to a [`ParseError`].
+fn token_err_to_parse_err(e: xml_tokenizer::TokenError) -> ParseError {
+    match e {
+        xml_tokenizer::TokenError::InvalidUtf8 => ParseError::InvalidUtf8,
+        xml_tokenizer::TokenError::UnexpectedEof => ParseError::NotWellFormed {
+            offset: 0,
+            message: "unexpected end of input",
+        },
+        xml_tokenizer::TokenError::IllegalCharacter { offset } => ParseError::NotWellFormed {
+            offset,
+            message: "illegal character",
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_simple_element() {
+        let doc = parse_bytes(b"<root/>", &ParserOptions::default()).unwrap();
+        let tree = doc.tree();
+        let elem = tree.first_child(doc.root()).unwrap();
+        assert_eq!(tree.name(elem), "root");
+    }
+
+    #[test]
+    fn parse_full_document() {
+        let xml = b"<?xml version=\"1.0\"?><root><child attr=\"val\">text</child></root>";
+        let doc = parse_bytes(xml, &ParserOptions::default()).unwrap();
+        let tree = doc.tree();
+        let root = tree.first_child(doc.root()).unwrap();
+        assert_eq!(tree.name(root), "root");
+        let child = tree.first_child(root).unwrap();
+        assert_eq!(tree.name(child), "child");
+        assert_eq!(tree.attr_value(&tree.attrs(child)[0]), "val");
+        let txt = tree.first_child(child).unwrap();
+        assert_eq!(tree.value(txt), "text");
+    }
+
+    #[test]
+    fn invalid_utf8_returns_error() {
+        let result = parse_bytes(b"\xff\xfe", &ParserOptions::default());
+        assert!(matches!(result, Err(ParseError::InvalidUtf8)));
+    }
+
+    #[test]
+    fn not_well_formed_returns_error() {
+        // `<<` is illegal — the tokenizer catches it immediately.
+        let result = parse_bytes(b"<<", &ParserOptions::default());
+        assert!(matches!(result, Err(ParseError::NotWellFormed { .. })));
+    }
+
+    #[test]
+    fn empty_input_returns_no_root_error() {
+        let result = parse_bytes(b"", &ParserOptions::default());
+        assert!(matches!(result, Err(ParseError::NoRootElement)));
+    }
 }

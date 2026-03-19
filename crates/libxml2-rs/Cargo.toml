@@ -9,6 +9,8 @@ repository.workspace  = true
 homepage.workspace    = true
 
 [dependencies]
+xml-tokenizer = { path = "../xml-tokenizer" }
+xml-tree      = { path = "../xml-tree" }
 
 [dev-dependencies]
 # No extra dev-deps yet — the xmlconf test runner uses only std + libxml2-rs itself.
