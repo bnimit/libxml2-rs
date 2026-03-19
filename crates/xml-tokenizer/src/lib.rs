@@ -93,7 +93,7 @@ pub enum TokenError {
 /// Zero-copy tokenizer over a UTF-8 byte slice.
 pub struct Tokenizer<'a> {
     input: &'a [u8],
-    pos:   usize,
+    pos: usize,
 }
 
 impl<'a> Tokenizer<'a> {

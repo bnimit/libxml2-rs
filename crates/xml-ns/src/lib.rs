@@ -55,11 +55,17 @@ pub struct QName {
 impl QName {
     /// Create a name with no namespace.
     pub fn local(name: &str) -> Self {
-        Self { ns: None, local: name.into() }
+        Self {
+            ns: None,
+            local: name.into(),
+        }
     }
 
     /// Create a namespaced name.
     pub fn namespaced(ns: NsUri, local: &str) -> Self {
-        Self { ns: Some(ns), local: local.into() }
+        Self {
+            ns: Some(ns),
+            local: local.into(),
+        }
     }
 }

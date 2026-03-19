@@ -45,25 +45,25 @@ pub struct NameId(u32);
 #[non_exhaustive]
 pub enum NodeKind {
     /// Element node (`<foo/>`)
-    Element            = 1,
+    Element = 1,
     /// Attribute node
-    Attribute          = 2,
+    Attribute = 2,
     /// Text node
-    Text               = 3,
+    Text = 3,
     /// CDATA section
-    CData              = 4,
+    CData = 4,
     /// Entity reference
-    EntityRef          = 5,
+    EntityRef = 5,
     /// Processing instruction
-    Pi                 = 7,
+    Pi = 7,
     /// Comment
-    Comment            = 8,
+    Comment = 8,
     /// Document node (root)
-    Document           = 9,
+    Document = 9,
     /// Document type declaration
-    DocumentType       = 10,
+    DocumentType = 10,
     /// Document fragment
-    DocumentFragment   = 11,
+    DocumentFragment = 11,
 }
 
 /// Internal storage for a single node. 64 bytes — fits in one cache line.
@@ -72,30 +72,30 @@ pub enum NodeKind {
 /// `Document::string_arena`. Node cross-references use `Option<NodeId>`.
 #[repr(C)]
 struct NodeData {
-    kind:         NodeKind,
-    _pad:         [u8; 3],
-    name:         NameId,
-    parent:       Option<NodeId>,
-    first_child:  Option<NodeId>,
-    last_child:   Option<NodeId>,
+    kind: NodeKind,
+    _pad: [u8; 3],
+    name: NameId,
+    parent: Option<NodeId>,
+    first_child: Option<NodeId>,
+    last_child: Option<NodeId>,
     next_sibling: Option<NodeId>,
     prev_sibling: Option<NodeId>,
     // Text/value content: byte range into string_arena
     value_offset: u32,
-    value_len:    u32,
+    value_len: u32,
     // Attributes: index range into Document::attrs
-    attrs_start:  u32,
-    attrs_end:    u32,
+    attrs_start: u32,
+    attrs_end: u32,
 }
 
 /// An XML document. Owns all node and string data.
 ///
 /// `Document` is `Send + Sync` — nodes are stored by index, not raw pointer.
 pub struct Document {
-    nodes:        Vec<NodeData>,
+    nodes: Vec<NodeData>,
     string_arena: bumpalo::Bump,
     // TODO(Phase 1): add name interning table, attribute storage, ns table
-    root:         NodeId,
+    root: NodeId,
 }
 
 impl Document {
@@ -103,18 +103,18 @@ impl Document {
     pub fn new() -> Self {
         let mut nodes = Vec::with_capacity(64);
         nodes.push(NodeData {
-            kind:         NodeKind::Document,
-            _pad:         [0; 3],
-            name:         NameId(0),
-            parent:       None,
-            first_child:  None,
-            last_child:   None,
+            kind: NodeKind::Document,
+            _pad: [0; 3],
+            name: NameId(0),
+            parent: None,
+            first_child: None,
+            last_child: None,
             next_sibling: None,
             prev_sibling: None,
             value_offset: 0,
-            value_len:    0,
-            attrs_start:  0,
-            attrs_end:    0,
+            value_len: 0,
+            attrs_start: 0,
+            attrs_end: 0,
         });
         Self {
             nodes,
