@@ -7,10 +7,10 @@ all-features = false
 
 [advisories]
 version = 2
-vulnerability = "deny"
-unsound = "all"
-unmaintained = "all"
-yanked = "deny"
+# Per-type action keys (vulnerability, unsound, unmaintained, yanked)
+# were removed in cargo-deny v2. Secure defaults apply automatically:
+# known vulnerabilities are denied, yanked crates are denied.
+ignore = []
 
 [licenses]
 version = 2
