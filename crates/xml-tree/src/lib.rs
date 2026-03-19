@@ -19,6 +19,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
+// TODO(Phase 1): remove once all stub fields are wired up
+#![allow(dead_code)]
 
 extern crate alloc;
 
