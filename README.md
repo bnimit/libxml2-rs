@@ -17,7 +17,7 @@ This project is a **complete, drop-in replacement**:
 > **This project is in the architecture and early implementation phase.**
 > We are actively seeking contributors, reviewers, and domain experts.
 
-See [ARCHITECTURE_PLAN.md](ARCHITECTURE_PLAN.md) for the full technical design.
+See [docs/architecture/overview.md](docs/architecture/overview.md) for the full technical design.
 
 ### Roadmap
 
@@ -86,7 +86,7 @@ We welcome contributions at every level — from reviewing the architecture to i
 **Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.**
 
 Areas where help is especially valuable right now:
-- Review of [ARCHITECTURE_PLAN.md](ARCHITECTURE_PLAN.md) — feedback from XML spec experts, parser engineers, and libxml2 users is invaluable
+- Review of [docs/architecture/overview.md](docs/architecture/overview.md) — feedback from XML spec experts, parser engineers, and libxml2 users is invaluable
 - XSD 1.0 (XML Schema) — the largest and most complex module; domain expertise welcome
 - W3C/OASIS conformance test harness infrastructure
 - XSLT 1.0 implementation design

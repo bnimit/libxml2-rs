@@ -47,7 +47,7 @@ git push --force-with-lease
 
 ### Right now (architecture phase)
 
-- **Review [ARCHITECTURE_PLAN.md](ARCHITECTURE_PLAN.md)** — open an issue with your feedback. We especially want input from:
+- **Review [docs/architecture/overview.md](docs/architecture/overview.md)** — open an issue with your feedback. We especially want input from:
   - libxml2 users who can identify missing or incorrect API descriptions
   - XML/XSD/RelaxNG/XSLT spec experts
   - Rust library authors with experience in parser design or arena allocators
@@ -57,7 +57,7 @@ git push --force-with-lease
 
 ### Ongoing
 
-- **Implement a crate** — pick an unstarted crate from the workspace (see [ARCHITECTURE_PLAN.md](ARCHITECTURE_PLAN.md) Section 7 for phasing) and open an issue to claim it before starting.
+- **Implement a crate** — pick an unstarted crate from the workspace (see [docs/architecture/overview.md](docs/architecture/overview.md) Section 7 for phasing) and open an issue to claim it before starting.
 - **Write conformance test infrastructure** — W3C xmlconf, W3C XSTS, OASIS RelaxNG, html5lib-tests harnesses.
 - **Add fuzz targets** — `fuzz/fuzz_targets/` for any parsing path.
 - **Improve documentation** — rustdoc examples, mdBook guide pages, C API migration guide.

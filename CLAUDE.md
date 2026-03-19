@@ -1,6 +1,29 @@
 # CLAUDE.md — libxml2-rs
 
-A memory-safe Rust replacement for libxml2. Full design rationale is in `ARCHITECTURE_PLAN.md`.
+A memory-safe Rust replacement for libxml2. Full design rationale is in `docs/architecture/overview.md`.
+
+## Repository Layout Convention
+
+This project follows standard OSS file placement rules — **do not reorganise these without good reason:**
+
+**Root-level files (GitHub magic files — must stay at root):**
+- `README.md`, `LICENSE`, `CLAUDE.md` — project identity
+- `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `MAINTAINERS.md` — community health files; GitHub surfaces these automatically in PRs, issues, and the community tab
+- `SECURITY.md` — GitHub wires this to the "Report a vulnerability" button; must be at root
+- `CHANGELOG.md` — convention for release consumers and tooling
+
+**`docs/` — reference and user-facing documentation:**
+- `docs/architecture/` — technical design documents (start here for context)
+  - `docs/architecture/overview.md` — the primary architecture plan
+- `docs/guide/` — mdBook user guide (Phase 1 deliverable)
+
+**`crates/` — library crates (one directory per crate)**
+
+**`tools/` — binary crates (CLI tools)**
+
+**`fuzz/`, `benches/`, `tests/` — quality infrastructure at workspace root**
+
+**`.github/`** — GitHub Actions workflows, issue templates, `CODEOWNERS`
 
 ## Essential Commands
 
