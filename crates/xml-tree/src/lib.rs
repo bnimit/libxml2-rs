@@ -346,7 +346,12 @@ impl Document {
 
     /// Link `child` as the last child of `parent`, maintaining the
     /// doubly-linked sibling list.
-    fn append_child(&mut self, parent: NodeId, child: NodeId) {
+    ///
+    /// `child` must not already be attached to a parent — call
+    /// [`unlink_node`] first if needed.
+    ///
+    /// [`unlink_node`]: Document::unlink_node
+    pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
         // Rust note: we can't hold two mutable references into `self.nodes`
         // simultaneously, so we read what we need first, then write.
         let old_last = self.nodes[parent.0 as usize].last_child;
@@ -359,6 +364,46 @@ impl Document {
             None => self.nodes[parent.0 as usize].first_child = Some(child),
         }
         self.nodes[parent.0 as usize].last_child = Some(child);
+    }
+
+    // -----------------------------------------------------------------------
+    // Node unlinking
+    // -----------------------------------------------------------------------
+
+    /// Detach `node` from its parent and siblings.
+    ///
+    /// The node (and its entire subtree) remains in the arena with its
+    /// [`NodeId`] intact — it is simply disconnected from the tree.  Use
+    /// [`append_child`] to reattach it elsewhere.
+    ///
+    /// Unlinking the document root is a no-op.
+    ///
+    /// [`append_child`]: Document::append_child
+    pub fn unlink_node(&mut self, node: NodeId) {
+        let parent = match self.nodes[node.0 as usize].parent {
+            Some(p) => p,
+            None => return, // already detached or document root
+        };
+
+        let prev = self.nodes[node.0 as usize].prev_sibling;
+        let next = self.nodes[node.0 as usize].next_sibling;
+
+        // Fix up the previous sibling (or parent's first_child).
+        match prev {
+            Some(p) => self.nodes[p.0 as usize].next_sibling = next,
+            None => self.nodes[parent.0 as usize].first_child = next,
+        }
+
+        // Fix up the next sibling (or parent's last_child).
+        match next {
+            Some(n) => self.nodes[n.0 as usize].prev_sibling = prev,
+            None => self.nodes[parent.0 as usize].last_child = prev,
+        }
+
+        // Clear the node's own links.
+        self.nodes[node.0 as usize].parent = None;
+        self.nodes[node.0 as usize].prev_sibling = None;
+        self.nodes[node.0 as usize].next_sibling = None;
     }
 
     // -----------------------------------------------------------------------
@@ -521,6 +566,244 @@ impl Document {
         });
         self.append_child(parent, id);
         id
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtree copy helpers (private)
+// ---------------------------------------------------------------------------
+
+/// Intermediate representation for copying a subtree.
+///
+/// Produced by [`collect_subtree_data`] (immutable borrow) and consumed by
+/// [`paste_subtree_data`] (mutable borrow).  The two-phase approach avoids
+/// the borrow-checker conflict that would arise from reading and writing
+/// `Document::strings` / `Document::names` at the same time.
+struct NodeCopy {
+    kind: NodeKind,
+    /// Actual interned name — local element name or PI target.
+    /// For text/comment/CDATA this holds the pseudo-name; it is ignored on paste.
+    name: String,
+    /// Namespace URI of the element/attribute, or `""`.
+    ns: String,
+    /// String value (text, comment, CDATA content, PI data).
+    value: String,
+    /// `(local, ns_uri, value)` for each attribute.
+    attrs: Vec<(String, String, String)>,
+    /// Copied children, in document order.
+    children: Vec<NodeCopy>,
+}
+
+/// Phase 1 — collect the subtree at `node` into an owned [`NodeCopy`].
+///
+/// Only uses the public read API of [`Document`]; the immutable borrow is
+/// released when this function returns.
+fn collect_subtree_data(doc: &Document, node: NodeId) -> NodeCopy {
+    let kind = doc.kind(node);
+    // `name()` returns the real name for Element/Pi; pseudo-names otherwise.
+    let name = doc.name(node).to_owned();
+    let ns = doc.ns_uri(node).to_owned();
+    let value = doc.value(node).to_owned();
+    let attrs = doc
+        .attrs(node)
+        .iter()
+        .map(|a| {
+            (
+                doc.attr_name(a).to_owned(),
+                doc.attr_ns_uri(a).to_owned(),
+                doc.attr_value(a).to_owned(),
+            )
+        })
+        .collect();
+    let children = doc
+        .children(node)
+        .map(|c| collect_subtree_data(doc, c))
+        .collect();
+    NodeCopy { kind, name, ns, value, attrs, children }
+}
+
+/// Phase 2 — paste `copy` as the last child of `parent`, returning the new node.
+fn paste_subtree_data(doc: &mut Document, copy: &NodeCopy, parent: NodeId) -> NodeId {
+    let new_id = match copy.kind {
+        NodeKind::Element => {
+            let id = doc.append_element_ns(parent, &copy.name, &copy.ns);
+            for (aname, ans, aval) in &copy.attrs {
+                doc.add_attr_ns(id, aname, ans, aval);
+            }
+            id
+        }
+        NodeKind::Text => doc.append_text(parent, &copy.value),
+        NodeKind::Comment => doc.append_comment(parent, &copy.value),
+        NodeKind::CData => doc.append_cdata(parent, &copy.value),
+        NodeKind::Pi => doc.append_pi(parent, &copy.name, &copy.value),
+        // Other node kinds (EntityRef, DocumentType, …): create a structural
+        // placeholder so the subtree shape is preserved.
+        _ => {
+            let name_id = doc.intern_name(&copy.name);
+            let ns_id = doc.intern_name(&copy.ns);
+            let (vo, vl) = doc.alloc_str(&copy.value);
+            let attrs_start = doc.attrs.len() as u32;
+            let id = doc.push_node(NodeData {
+                kind: copy.kind,
+                name: name_id,
+                ns: ns_id,
+                parent: None,
+                first_child: None,
+                last_child: None,
+                next_sibling: None,
+                prev_sibling: None,
+                value_offset: vo,
+                value_len: vl,
+                attrs_start,
+                attrs_end: attrs_start,
+            });
+            doc.append_child(parent, id);
+            id
+        }
+    };
+    for child in &copy.children {
+        paste_subtree_data(doc, child, new_id);
+    }
+    new_id
+}
+
+impl Document {
+    // -----------------------------------------------------------------------
+    // Subtree copying and document cloning
+    // -----------------------------------------------------------------------
+
+    /// Copy the subtree rooted at `src`, appending the copy as the last child
+    /// of `dest`.  Returns the [`NodeId`] of the new root.
+    ///
+    /// String data is cloned; the copy shares no arena storage with the
+    /// original.  All existing [`NodeId`] values remain valid after this call.
+    pub fn copy_subtree(&mut self, src: NodeId, dest: NodeId) -> NodeId {
+        // Phase 1: collect into owned data (immutable borrow of `self`).
+        let subtree = collect_subtree_data(self, src);
+        // Phase 2: paste (mutable borrow of `self`).  No simultaneous borrows.
+        paste_subtree_data(self, &subtree, dest)
+    }
+
+    /// Create a structurally identical, fully independent clone of this document.
+    ///
+    /// All nodes, attributes, and string data are duplicated.
+    pub fn deep_clone(&self) -> Document {
+        let mut dst = Document::new();
+        let dst_root = dst.root();
+        // Collect children while `self` is borrowed immutably.
+        let children: Vec<NodeId> = self.children(self.root()).collect();
+        for child in children {
+            let subtree = collect_subtree_data(self, child);
+            paste_subtree_data(&mut dst, &subtree, dst_root);
+        }
+        dst
+    }
+
+    // -----------------------------------------------------------------------
+    // Attribute mutation
+    // -----------------------------------------------------------------------
+
+    /// Set attribute `local` (no namespace) to `value` on element `elem`.
+    ///
+    /// If an attribute with this name already exists, its value is updated
+    /// in place.  If not, a new attribute is appended to `elem`'s list.
+    pub fn set_attr(&mut self, elem: NodeId, local: &str, value: &str) {
+        self.set_attr_ns(elem, local, "", value);
+    }
+
+    /// Set attribute `local` in namespace `ns_uri` to `value` on element `elem`.
+    ///
+    /// If an attribute with this `(local, ns_uri)` pair already exists its
+    /// value is updated; otherwise a new attribute is appended.
+    pub fn set_attr_ns(&mut self, elem: NodeId, local: &str, ns_uri: &str, value: &str) {
+        // ── Update existing attribute in-place ───────────────────────────────
+        if let Some(pos) = self.find_attr_pos(elem, local, ns_uri) {
+            // Append new value to the arena; old value is an orphan (harmless).
+            let (vo, vl) = self.alloc_str(value);
+            self.attrs[pos].value_offset = vo;
+            self.attrs[pos].value_len = vl;
+            return;
+        }
+
+        // ── Insert new attribute at elem.attrs_end ───────────────────────────
+        let name_id = self.intern_name(local);
+        let ns_id = self.intern_name(ns_uri);
+        let (vo, vl) = self.alloc_str(value);
+        let insert_pos = self.nodes[elem.0 as usize].attrs_end as usize;
+        self.attrs.insert(
+            insert_pos,
+            AttrData { name: name_id, ns: ns_id, value_offset: vo, value_len: vl },
+        );
+        self.fixup_attrs_after_insert(insert_pos as u32, elem);
+    }
+
+    /// Remove attribute `local` (no namespace) from element `elem`.
+    ///
+    /// Returns `true` if the attribute was found and removed, `false` if it
+    /// did not exist.
+    pub fn remove_attr(&mut self, elem: NodeId, local: &str) -> bool {
+        self.remove_attr_ns(elem, local, "")
+    }
+
+    /// Remove attribute `local` in namespace `ns_uri` from element `elem`.
+    ///
+    /// Returns `true` if the attribute was found and removed, `false` if it
+    /// did not exist.
+    pub fn remove_attr_ns(&mut self, elem: NodeId, local: &str, ns_uri: &str) -> bool {
+        let Some(pos) = self.find_attr_pos(elem, local, ns_uri) else {
+            return false;
+        };
+        self.attrs.remove(pos);
+        self.fixup_attrs_after_remove(pos as u32);
+        true
+    }
+
+    /// Return the index of attribute `(local, ns_uri)` within `elem`'s attribute
+    /// slice, or `None` if it does not exist.
+    fn find_attr_pos(&self, elem: NodeId, local: &str, ns_uri: &str) -> Option<usize> {
+        let n = &self.nodes[elem.0 as usize];
+        // If the name or namespace has never been interned the attr can't exist.
+        let local_id = self.names.get_index_of(local)? as u32;
+        let ns_id = self.names.get_index_of(ns_uri)? as u32;
+        (n.attrs_start as usize..n.attrs_end as usize)
+            .find(|&pos| self.attrs[pos].name.0 == local_id && self.attrs[pos].ns.0 == ns_id)
+    }
+
+    /// Fixup every node's `attrs_start`/`attrs_end` after inserting one slot
+    /// at `pos` in `self.attrs`.
+    ///
+    /// `elem` is the element that owns the new attr — only its `attrs_end` is
+    /// incremented.  Every other node whose range starts at or after `pos` is
+    /// shifted right by one.
+    fn fixup_attrs_after_insert(&mut self, pos: u32, elem: NodeId) {
+        let elem_idx = elem.0 as usize;
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            if i == elem_idx {
+                // Expand the owning element's range.
+                node.attrs_end += 1;
+            } else if node.attrs_start >= pos {
+                // Range starts at or after the insert point — shift both ends.
+                node.attrs_start += 1;
+                node.attrs_end += 1;
+            } else if node.attrs_end > pos {
+                // Range spans the insert point (defensive; shouldn't occur with
+                // non-overlapping attr ranges).
+                node.attrs_end += 1;
+            }
+        }
+    }
+
+    /// Fixup every node's `attrs_start`/`attrs_end` after removing the slot
+    /// at `pos` from `self.attrs`.
+    fn fixup_attrs_after_remove(&mut self, pos: u32) {
+        for node in self.nodes.iter_mut() {
+            if node.attrs_start > pos {
+                node.attrs_start -= 1;
+            }
+            if node.attrs_end > pos {
+                node.attrs_end -= 1;
+            }
+        }
     }
 }
 
@@ -1883,5 +2166,338 @@ mod tests {
         let b = doc.first_child(a).unwrap();
         let xml = doc.serialize_node(b, &SerializeOptions::default());
         assert_eq!(xml, "<b><c/></b>");
+    }
+
+    // -----------------------------------------------------------------------
+    // unlink_node / append_child
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unlink_middle_node() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let a = doc.append_element(root, "a");
+        let b = doc.append_element(root, "b");
+        let c = doc.append_element(root, "c");
+
+        doc.unlink_node(b);
+
+        // b is fully detached.
+        assert_eq!(doc.parent(b), None);
+        assert_eq!(doc.prev_sibling(b), None);
+        assert_eq!(doc.next_sibling(b), None);
+
+        // a and c are still linked correctly.
+        assert_eq!(doc.next_sibling(a), Some(c));
+        assert_eq!(doc.prev_sibling(c), Some(a));
+        assert_eq!(doc.first_child(root), Some(a));
+        assert_eq!(doc.last_child(root), Some(c));
+    }
+
+    #[test]
+    fn unlink_first_node() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let a = doc.append_element(root, "a");
+        let b = doc.append_element(root, "b");
+
+        doc.unlink_node(a);
+
+        assert_eq!(doc.first_child(root), Some(b));
+        assert_eq!(doc.prev_sibling(b), None);
+    }
+
+    #[test]
+    fn unlink_last_node() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let a = doc.append_element(root, "a");
+        let b = doc.append_element(root, "b");
+
+        doc.unlink_node(b);
+
+        assert_eq!(doc.last_child(root), Some(a));
+        assert_eq!(doc.next_sibling(a), None);
+    }
+
+    #[test]
+    fn unlink_and_reattach() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let a = doc.append_element(root, "a");
+        let b = doc.append_element(root, "b");
+        let container = doc.append_element(root, "container");
+
+        doc.unlink_node(b);
+        doc.append_child(container, b);
+
+        assert_eq!(doc.parent(b), Some(container));
+        assert_eq!(doc.first_child(container), Some(b));
+
+        let root_children: Vec<NodeId> = doc.children(root).collect();
+        assert_eq!(root_children, vec![a, container]);
+    }
+
+    // -----------------------------------------------------------------------
+    // copy_subtree
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn copy_subtree_basic() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let src = doc.append_element(root, "source");
+        doc.add_attr(src, "id", "1");
+        doc.append_text(src, "hello");
+
+        let dest = doc.append_element(root, "dest");
+        let copy = doc.copy_subtree(src, dest);
+
+        assert_ne!(copy, src);
+        assert_eq!(doc.name(copy), "source");
+        assert_eq!(doc.parent(copy), Some(dest));
+
+        let copy_attrs = doc.attrs(copy);
+        assert_eq!(copy_attrs.len(), 1);
+        assert_eq!(doc.attr_name(&copy_attrs[0]), "id");
+        assert_eq!(doc.attr_value(&copy_attrs[0]), "1");
+
+        let copy_child = doc.first_child(copy).unwrap();
+        assert_eq!(doc.kind(copy_child), NodeKind::Text);
+        assert_eq!(doc.value(copy_child), "hello");
+    }
+
+    #[test]
+    fn copy_subtree_preserves_deep_structure() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let src = doc.append_element(root, "a");
+        let b1 = doc.append_element(src, "b1");
+        doc.append_element(b1, "c");
+        doc.append_element(src, "b2");
+
+        let dest = doc.append_element(root, "dest");
+        let copy_a = doc.copy_subtree(src, dest);
+
+        let child_names: Vec<&str> = doc.children(copy_a).map(|c| doc.name(c)).collect();
+        assert_eq!(child_names, ["b1", "b2"]);
+
+        let copy_b1 = doc.first_child(copy_a).unwrap();
+        let grandchild = doc.first_child(copy_b1).unwrap();
+        assert_eq!(doc.name(grandchild), "c");
+    }
+
+    #[test]
+    fn copy_subtree_namespace_preserved() {
+        let mut doc = build(
+            b"<root xmlns:svg=\"http://www.w3.org/2000/svg\"><svg:circle r=\"5\"/></root>",
+        )
+        .unwrap();
+        let root_elem = doc.first_child(doc.root()).unwrap();
+        let circle = doc.first_child(root_elem).unwrap();
+
+        let copy = doc.copy_subtree(circle, root_elem);
+
+        assert_eq!(doc.name(copy), "circle");
+        assert_eq!(doc.ns_uri(copy), "http://www.w3.org/2000/svg");
+        let copy_attrs = doc.attrs(copy);
+        assert_eq!(doc.attr_value(&copy_attrs[0]), "5");
+    }
+
+    // -----------------------------------------------------------------------
+    // deep_clone
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deep_clone_structural_equality() {
+        let doc = build(b"<root id=\"x\"><child>text</child></root>").unwrap();
+        let clone = doc.deep_clone();
+
+        let orig_elem = doc.first_child(doc.root()).unwrap();
+        let clone_elem = clone.first_child(clone.root()).unwrap();
+
+        assert_eq!(doc.name(orig_elem), clone.name(clone_elem));
+        assert_eq!(doc.ns_uri(orig_elem), clone.ns_uri(clone_elem));
+
+        let orig_attrs = doc.attrs(orig_elem);
+        let clone_attrs = clone.attrs(clone_elem);
+        assert_eq!(orig_attrs.len(), clone_attrs.len());
+        assert_eq!(
+            doc.attr_value(&orig_attrs[0]),
+            clone.attr_value(&clone_attrs[0])
+        );
+
+        let orig_child = doc.first_child(orig_elem).unwrap();
+        let clone_child = clone.first_child(clone_elem).unwrap();
+        let orig_text = doc.first_child(orig_child).unwrap();
+        let clone_text = clone.first_child(clone_child).unwrap();
+        assert_eq!(doc.value(orig_text), clone.value(clone_text));
+    }
+
+    #[test]
+    fn deep_clone_is_independent() {
+        let doc = build(b"<root/>").unwrap();
+        let mut clone = doc.deep_clone();
+
+        let clone_elem = clone.first_child(clone.root()).unwrap();
+        clone.set_attr(clone_elem, "added", "yes");
+        assert_eq!(clone.attrs(clone_elem).len(), 1);
+
+        // Original is unaffected.
+        let orig_elem = doc.first_child(doc.root()).unwrap();
+        assert_eq!(doc.attrs(orig_elem).len(), 0);
+    }
+
+    #[test]
+    fn deep_clone_roundtrip_xml() {
+        let xml = b"<a id=\"1\"><b>text</b><!-- note --></a>";
+        let doc = build(xml).unwrap();
+        let clone = doc.deep_clone();
+        assert_eq!(
+            doc.to_xml_string(&SerializeOptions::default()),
+            clone.to_xml_string(&SerializeOptions::default())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // set_attr / remove_attr
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn set_attr_appends_new() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let elem = doc.append_element(root, "a");
+        doc.set_attr(elem, "href", "https://example.com");
+
+        let attrs = doc.attrs(elem);
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(doc.attr_name(&attrs[0]), "href");
+        assert_eq!(doc.attr_value(&attrs[0]), "https://example.com");
+    }
+
+    #[test]
+    fn set_attr_updates_existing() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let elem = doc.append_element(root, "a");
+        doc.add_attr(elem, "href", "old");
+        doc.set_attr(elem, "href", "new");
+
+        let attrs = doc.attrs(elem);
+        assert_eq!(attrs.len(), 1, "no duplicate attr should be created");
+        assert_eq!(doc.attr_value(&attrs[0]), "new");
+    }
+
+    #[test]
+    fn set_attr_does_not_corrupt_sibling_attrs() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let a = doc.append_element(root, "a");
+        doc.add_attr(a, "x", "1");
+        let b = doc.append_element(root, "b");
+        doc.add_attr(b, "y", "2");
+
+        // Add a second attr to 'a' now that 'b' already has attrs.
+        doc.set_attr(a, "z", "3");
+
+        let a_attrs = doc.attrs(a);
+        assert_eq!(a_attrs.len(), 2);
+        assert_eq!(doc.attr_name(&a_attrs[0]), "x");
+        assert_eq!(doc.attr_value(&a_attrs[0]), "1");
+        assert_eq!(doc.attr_name(&a_attrs[1]), "z");
+        assert_eq!(doc.attr_value(&a_attrs[1]), "3");
+
+        let b_attrs = doc.attrs(b);
+        assert_eq!(b_attrs.len(), 1);
+        assert_eq!(doc.attr_name(&b_attrs[0]), "y");
+        assert_eq!(doc.attr_value(&b_attrs[0]), "2");
+    }
+
+    #[test]
+    fn set_attr_ns_new() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let elem = doc.append_element(root, "a");
+        doc.set_attr_ns(elem, "href", "http://www.w3.org/1999/xlink", "url");
+
+        let attrs = doc.attrs(elem);
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(doc.attr_name(&attrs[0]), "href");
+        assert_eq!(doc.attr_ns_uri(&attrs[0]), "http://www.w3.org/1999/xlink");
+        assert_eq!(doc.attr_value(&attrs[0]), "url");
+    }
+
+    #[test]
+    fn remove_attr_existing() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let elem = doc.append_element(root, "a");
+        doc.add_attr(elem, "href", "x");
+        doc.add_attr(elem, "class", "y");
+
+        let removed = doc.remove_attr(elem, "href");
+        assert!(removed);
+
+        let attrs = doc.attrs(elem);
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(doc.attr_name(&attrs[0]), "class");
+        assert_eq!(doc.attr_value(&attrs[0]), "y");
+    }
+
+    #[test]
+    fn remove_attr_nonexistent() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let elem = doc.append_element(root, "a");
+        assert!(!doc.remove_attr(elem, "href"));
+    }
+
+    #[test]
+    fn remove_attr_does_not_corrupt_sibling_attrs() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let a = doc.append_element(root, "a");
+        doc.add_attr(a, "x", "1");
+        doc.add_attr(a, "y", "2");
+        let b = doc.append_element(root, "b");
+        doc.add_attr(b, "z", "3");
+
+        doc.remove_attr(a, "x");
+
+        let a_attrs = doc.attrs(a);
+        assert_eq!(a_attrs.len(), 1);
+        assert_eq!(doc.attr_name(&a_attrs[0]), "y");
+        assert_eq!(doc.attr_value(&a_attrs[0]), "2");
+
+        let b_attrs = doc.attrs(b);
+        assert_eq!(b_attrs.len(), 1);
+        assert_eq!(doc.attr_name(&b_attrs[0]), "z");
+        assert_eq!(doc.attr_value(&b_attrs[0]), "3");
+    }
+
+    #[test]
+    fn mutation_roundtrip_xml() {
+        // Build a doc, mutate it via the new API, and verify the serialized XML.
+        let mut doc = build(b"<root><child id=\"old\"/></root>").unwrap();
+        let root_elem = doc.first_child(doc.root()).unwrap();
+        let child = doc.first_child(root_elem).unwrap();
+
+        doc.set_attr(child, "id", "new");
+        doc.set_attr(child, "extra", "yes");
+
+        let xml = doc.to_xml_string(&SerializeOptions::default());
+        let reparsed = build(xml.as_bytes()).unwrap();
+        let rp_root = reparsed.first_child(reparsed.root()).unwrap();
+        let rp_child = reparsed.first_child(rp_root).unwrap();
+
+        let rp_attrs = reparsed.attrs(rp_child);
+        assert_eq!(rp_attrs.len(), 2);
+        let id_val = rp_attrs
+            .iter()
+            .find(|a| reparsed.attr_name(a) == "id")
+            .map(|a| reparsed.attr_value(a))
+            .unwrap_or("");
+        assert_eq!(id_val, "new");
     }
 }
