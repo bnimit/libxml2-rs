@@ -27,6 +27,8 @@ allow = [
     "CC0-1.0",
     # cbindgen (build-only dep) is MPL-2.0; does not affect output binary license
     "MPL-2.0",
+    # encoding_rs is (Apache-2.0 OR MIT) AND BSD-3-Clause
+    "BSD-3-Clause",
 ]
 
 [bans]
