@@ -78,8 +78,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v1
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
 
@@ -96,4 +100,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run conformance tests
-        run: cargo test --workspace --features conformance-tests -- --nocapture
+        run: cargo test --workspace -- --nocapture

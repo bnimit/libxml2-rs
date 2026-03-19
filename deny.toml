@@ -1,0 +1,39 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Only check dependencies for the default feature set
+all-features = false
+
+[advisories]
+# Deny crates with known security vulnerabilities
+version = 2
+deny = ["unsound", "unmaintained", "yanked"]
+
+[licenses]
+version = 2
+# Licenses we explicitly allow
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+]
+
+[bans]
+# Deny multiple versions of the same crate where possible
+multiple-versions = "warn"
+deny = []
+
+[sources]
+# Only allow crates from crates.io
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
